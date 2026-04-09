@@ -121,3 +121,10 @@ src/akoma_markup/
 - **Empty output file with "N sections failed conversion":** every LLM call
   failed. Check credentials, model name, and network access, then rerun — the
   checkpoint cache will skip any sections that did succeed.
+
+## License
+
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE)
+(AGPL-3.0-or-later). If you run a modified version of this software as a
+network service, you must make the modified source code available to its
+users.
