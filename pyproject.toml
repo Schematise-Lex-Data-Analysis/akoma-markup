@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "akoma-markup"
+version = "0.1.0"
+description = "Convert BNSS 2023 PDF to Akoma Ntoso / Laws.Africa plaintext markup using any LangChain LLM."
+requires-python = ">=3.10"
+dependencies = [
+    "pdfplumber>=0.10",
+    "langchain-core>=0.2",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+azure = ["langchain-azure-ai"]
+anthropic = ["langchain-anthropic"]
+
+[project.scripts]
+akoma-markup = "akoma_markup.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
