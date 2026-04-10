@@ -1,13 +1,13 @@
 # akoma-markup
 
-Convert the law PDFs(source - https://www.indiacode.nic.in/) into
-[Akoma Ntoso](https://www.akomantoso.org/) / [Laws.Africa](https://laws.africa/)
-plaintext markup using any LangChain chat model.
+akom-markup is an open course tool (pypi package and cli) for converting law pdfs (source - https://www.indiacode.nic.in/) into markup files following the [Akoma Ntoso](https://www.oasis-open.org/standard/akn-v1-0/) / [Laws.Africa](https://laws.africa/) markup format.
 
-The package extracts text from the law PDF, parses its table of contents and
-sections, then uses an LLM to rewrite each section into Akoma Ntoso markup.
-Output is a single `.txt` file plus a `.meta.json` sidecar with conversion
-metadata.
+
+# Roadmap
+![roadmap](image.png)
+
+# Setting up for development
+
 
 ## Installation
 
