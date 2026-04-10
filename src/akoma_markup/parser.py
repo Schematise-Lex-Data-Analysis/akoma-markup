@@ -1,6 +1,7 @@
 """TOC and section parsing for BNSS 2023 documents."""
 
 import re
+import sys
 
 
 def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
@@ -54,7 +55,38 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
 
         i += 1
 
+    validate_toc_sections(sections)
     return chapters, sections, toc_end_line
+
+
+def validate_toc_sections(sections: list[dict]):
+    """Check for gaps or misnumbering in TOC section numbers and log warnings.
+
+    Args:
+        sections: Section dicts with 'num' keys from parse_toc.
+    """
+    nums = []
+    for sec in sections:
+        m = re.match(r"(\d+)", sec["num"])
+        if m:
+            nums.append(int(m.group(1)))
+
+    for i in range(1, len(nums)):
+        if nums[i] - nums[i - 1] > 1:
+            gap_start = nums[i - 1] + 1
+            gap_end = nums[i] - 1
+            if gap_start == gap_end:
+                print(
+                    f"Warning: TOC missing section {gap_start} "
+                    f"(between {nums[i - 1]} and {nums[i]})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Warning: TOC missing sections {gap_start}-{gap_end} "
+                    f"(between {nums[i - 1]} and {nums[i]})",
+                    file=sys.stderr,
+                )
 
 
 def extract_chapter_ranges(
@@ -135,9 +167,20 @@ def filter_sections_by_chapters(
             if not num_match:
                 return {"roman": "NA", "heading": "Unknown"}
             num = int(num_match.group(1))
+            # Exact match within a chapter range
             for ch in chapter_ranges:
                 if ch["start"] <= num <= ch["end"]:
                     return {"roman": ch["roman"], "heading": ch["heading"]}
+            # Fallback: assign to nearest chapter by distance
+            best = None
+            best_dist = float("inf")
+            for ch in chapter_ranges:
+                dist = min(abs(num - ch["start"]), abs(num - ch["end"]))
+                if dist < best_dist:
+                    best_dist = dist
+                    best = ch
+            if best:
+                return {"roman": best["roman"], "heading": best["heading"]}
         except (ValueError, KeyError):
             pass
         return {"roman": "NA", "heading": "Unknown"}
@@ -161,8 +204,9 @@ def extract_section_content(
 ) -> list[dict]:
     """Extract section content from the main body text.
 
-    Uses section headings from the TOC as regex anchors to locate each
-    section's body text.
+    Matches each section by its number (e.g. ``42.``) and captures everything
+    until the next section number begins.  Does not rely on heading text or
+    dash characters, making it resilient to formatting variations across PDFs.
 
     Args:
         full_text: Full text of the PDF (post-TOC portion).
@@ -175,7 +219,6 @@ def extract_section_content(
 
     for i, sec in enumerate(section_names):
         sec_num = sec["num"]
-        escaped_heading = re.escape(sec["heading"])
 
         if i + 1 < len(section_names):
             next_sec_num = section_names[i + 1]["num"]
@@ -183,10 +226,12 @@ def extract_section_content(
         else:
             stop_pattern = r"\Z"
 
-        pattern = (
-            rf"{sec_num}\.\s+{escaped_heading}[.\s]*[—\-–]\s*(.+?)(?={stop_pattern})"
-        )
+        pattern = rf"{sec_num}\.\s+.+?[—\-–\u2010-\u2015]?\s*(.+?)(?={stop_pattern})"
         match = re.search(pattern, full_text, re.DOTALL)
+
+        if not match:
+            pattern = rf"{sec_num}\.\s+(.+?)(?={stop_pattern})"
+            match = re.search(pattern, full_text, re.DOTALL)
 
         if match:
             content = match.group(1).strip()
