@@ -48,16 +48,16 @@ def convert(
 
     # 2. Parse TOC
     print("Parsing table of contents ...", file=sys.stderr)
-    _chapters, section_names = parse_toc(all_lines)
-    toc_lines = all_lines  # TOC parsing scans all lines and picks chapter headers
-    chapter_ranges = extract_chapter_ranges(toc_lines, section_names)
+    _chapters, section_names, toc_end_line = parse_toc(all_lines)
+    chapter_ranges = extract_chapter_ranges(all_lines, section_names, toc_end_line)
     print(
-        f"Found {len(chapter_ranges)} chapters, {len(section_names)} sections",
+        f"Found {len(chapter_ranges)} chapters, {len(section_names)} sections "
+        f"(TOC ends at line {toc_end_line})",
         file=sys.stderr,
     )
 
-    # 3. Extract section content (skip TOC — heuristic: first 800 lines)
-    content_text = "\n".join(all_lines[800:])
+    # 3. Extract section content (skip TOC)
+    content_text = "\n".join(all_lines[toc_end_line + 1:])
     sections = extract_section_content(content_text, section_names)
 
     # 4. Map sections to chapters and deduplicate

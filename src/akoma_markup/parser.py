@@ -3,7 +3,7 @@
 import re
 
 
-def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict]]:
+def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
     """Parse the Table of Contents to extract chapter names and section names.
 
     Expected TOC format:
@@ -11,14 +11,20 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict]]:
         <CHAPTER TITLE IN CAPS>
         <num>. <Section name>.
 
+    Scanning stops when the first chapter's roman numeral is encountered a
+    second time, which signals the start of the body text.
+
     Args:
         lines: All lines from the extracted PDF text.
 
     Returns:
-        Tuple of (chapters, sections) where each is a list of dicts.
+        Tuple of (chapters, sections, toc_end_line) where toc_end_line is the
+        index of the last TOC entry found.
     """
     chapters = []
     sections = []
+    toc_end_line = 0
+    first_chapter = None
 
     i = 0
     while i < len(lines):
@@ -27,10 +33,15 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict]]:
         chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
         if chapter_match:
             roman = chapter_match.group(1)
+            if first_chapter is not None and roman == first_chapter:
+                break
+            if first_chapter is None:
+                first_chapter = roman
             if i + 1 < len(lines):
                 title = lines[i + 1].strip()
                 if title and title != "SECTIONS" and not title.isdigit():
                     chapters.append({"roman": roman, "heading": title})
+            toc_end_line = i + 1
             i += 2
             continue
 
@@ -39,30 +50,35 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict]]:
             sections.append(
                 {"num": section_match.group(1), "heading": section_match.group(2)}
             )
+            toc_end_line = i
 
         i += 1
-    print (chapters, sections)
-    return chapters, sections
+
+    return chapters, sections, toc_end_line
 
 
 def extract_chapter_ranges(
-    toc_lines: list[str], section_names: list[dict]
+    toc_lines: list[str],
+    section_names: list[dict],
+    toc_end_line: int | None = None,
 ) -> list[dict]:
     """Extract chapter ranges (start/end section numbers) from the TOC.
 
     Args:
         toc_lines: Lines from the TOC portion of the PDF.
         section_names: Section dicts with 'num' and 'heading' keys.
+        toc_end_line: If provided, only scan up to this line index.
 
     Returns:
         List of chapter dicts with 'roman', 'heading', 'start', 'end' keys.
     """
+    end = toc_end_line + 1 if toc_end_line is not None else len(toc_lines)
     chapter_ranges = []
     current_chapter = None
     chapter_sections: list[int] = []
 
     i = 0
-    while i < len(toc_lines):
+    while i < end:
         line = toc_lines[i].strip()
 
         chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
