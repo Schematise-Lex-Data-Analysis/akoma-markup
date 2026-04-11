@@ -1,7 +1,16 @@
 """TOC and section parsing for BNSS 2023 documents."""
 
+import difflib
 import re
 import sys
+
+
+def _heading_similarity(heading1: str, heading2: str) -> float:
+    """Calculate fuzzy similarity ratio between two headings (0.0 to 1.0)."""
+    # Normalize: lowercase, remove punctuation at end, extra spaces
+    h1 = heading1.lower().strip().rstrip(".,;:-–—")
+    h2 = heading2.lower().strip().rstrip(".,;:-–—")
+    return difflib.SequenceMatcher(None, h1, h2).ratio()
 
 
 def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
@@ -22,6 +31,8 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
         Tuple of (chapters, sections, toc_end_line) where toc_end_line is the
         index of the last TOC entry found.
     """
+    print("[DEBUG] Starting TOC parsing...", file=sys.stderr)
+    print(f"[DEBUG] Total lines to parse: {len(lines)}", file=sys.stderr)
     chapters = []
     sections = []
     toc_end_line = 0
@@ -31,10 +42,16 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
     while i < len(lines):
         line = lines[i].strip()
 
+        # Check for body text start: CHAPTER 1 (Arabic numeral indicates body, not TOC)
+        if re.match(r"^CHAPTER\s+1$", line) and first_chapter == "I":
+            print(f"[DEBUG] Breaking TOC scan at line {i}: found CHAPTER 1 (body text start)", file=sys.stderr)
+            break
+
         chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
         if chapter_match:
             roman = chapter_match.group(1)
             if first_chapter is not None and roman == first_chapter:
+                print(f"[DEBUG] Breaking TOC scan at line {i}: found CHAPTER {roman} again", file=sys.stderr)
                 break
             if first_chapter is None:
                 first_chapter = roman
@@ -55,6 +72,9 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
 
         i += 1
 
+    print(f"[DEBUG] TOC parsing complete. Found {len(chapters)} chapters, {len(sections)} sections. TOC ends at line {toc_end_line}", file=sys.stderr)
+    print(f"[DEBUG] Chapters found: {[ch['roman'] for ch in chapters]}", file=sys.stderr)
+    print(f"[DEBUG] First 5 sections: {[s['num'] + '. ' + s['heading'] for s in sections[:5]]}", file=sys.stderr)
     validate_toc_sections(sections)
     return chapters, sections, toc_end_line
 
@@ -104,6 +124,7 @@ def extract_chapter_ranges(
     Returns:
         List of chapter dicts with 'roman', 'heading', 'start', 'end' keys.
     """
+    print("[DEBUG] Extracting chapter ranges...", file=sys.stderr)
     end = toc_end_line + 1 if toc_end_line is not None else len(toc_lines)
     chapter_ranges = []
     current_chapter = None
@@ -142,6 +163,7 @@ def extract_chapter_ranges(
         current_chapter["end"] = max(chapter_sections)
         chapter_ranges.append(current_chapter)
 
+    print(f"[DEBUG] Chapter ranges extracted: {[(c['roman'], c.get('start'), c.get('end')) for c in chapter_ranges]}", file=sys.stderr)
     return chapter_ranges
 
 
@@ -215,10 +237,19 @@ def extract_section_content(
     Returns:
         List of section dicts with 'num', 'heading', and 'content' keys.
     """
+    print("[DEBUG] Starting section content extraction...", file=sys.stderr)
+    print(f"[DEBUG] Total sections to extract: {len(section_names)}", file=sys.stderr)
+    print(f"[DEBUG] Full document length (chars): {len(full_text)}", file=sys.stderr)
+    print("[DEBUG] === FULL DOCUMENT TEXT (for OCR verification) ===", file=sys.stderr)
+    print(full_text[:5000], file=sys.stderr)  # First 5000 chars to avoid overwhelming output
+    if len(full_text) > 5000:
+        print(f"[DEBUG] ... (truncated, total {len(full_text)} characters)", file=sys.stderr)
+    print("[DEBUG] === END DOCUMENT TEXT SAMPLE ===", file=sys.stderr)
     sections_with_content = []
 
     for i, sec in enumerate(section_names):
         sec_num = sec["num"]
+        sec_heading = sec["heading"]
 
         if i + 1 < len(section_names):
             next_sec_num = section_names[i + 1]["num"]
@@ -226,17 +257,45 @@ def extract_section_content(
         else:
             stop_pattern = r"\Z"
 
-        pattern = rf"{sec_num}\.\s+.+?[—\-–\u2010-\u2015]?\s*(.+?)(?={stop_pattern})"
-        match = re.search(pattern, full_text, re.DOTALL)
+        # Find all candidate positions for this section number
+        # Pattern: section number followed by text until emdash, newline, or end
+        candidate_pattern = rf"\n{re.escape(sec_num)}\.\s+([^\n—–\-]+)"
+        candidates = list(re.finditer(candidate_pattern, full_text))
 
-        if not match:
-            pattern = rf"{sec_num}\.\s+(.+?)(?={stop_pattern})"
-            match = re.search(pattern, full_text, re.DOTALL)
+        best_match = None
+        best_similarity = 0.0
+        for cand in candidates:
+            # Extract the heading part from candidate (before emdash/newline)
+            cand_heading = cand.group(1).strip()
+            # Skip footnotes like "3. Ins. by Act..." or "3. Subs. by..."
+            if re.match(r"^(Ins\.|Subs\.|The\.|Certain|A\s|Sub\.|Omitted)", cand_heading, re.IGNORECASE):
+                continue
+            similarity = _heading_similarity(sec_heading, cand_heading)
+            if similarity > best_similarity and similarity >= 0.90:
+                best_similarity = similarity
+                best_match = cand
 
-        if match:
-            content = match.group(1).strip()
+        if best_match:
+            # Now extract the full content from this position until next section
+            start_pos = best_match.end()
+            # Find where next section starts
+            next_match = re.search(stop_pattern, full_text[start_pos:])
+            if next_match:
+                content = full_text[start_pos:start_pos + next_match.start()]
+            else:
+                content = full_text[start_pos:]
+            match = re.match(r".*", content)  # Dummy match to reuse existing logic
+            match_content = content
+        else:
+            match = None
+            match_content = None
+
+        if best_match and match_content is not None:
+            content = match_content.strip()
             content = re.sub(r"\n\d+\n", "\n", content)
             content = re.sub(r"\d+\[", "[", content)
+            if i < 15:
+                print(f"[DEBUG] Section {sec_num} matched with similarity {best_similarity:.2%} - content length: {len(content)} chars", file=sys.stderr)
             sections_with_content.append(
                 {"num": sec_num, "heading": sec["heading"], "content": content}
             )
@@ -244,8 +303,11 @@ def extract_section_content(
             fallback = "[Repealed/Omitted]" if (
                 "Repealed" in sec["heading"] or "Omitted" in sec["heading"]
             ) else ""
+            if i < 15:
+                print(f"[DEBUG] Section {sec_num} - NO CONTENT FOUND (tried {len(candidates)} candidates), using fallback: {fallback!r}", file=sys.stderr)
             sections_with_content.append(
                 {"num": sec_num, "heading": sec["heading"], "content": fallback}
             )
 
+    print(f"[DEBUG] Section content extraction complete. Total sections with content: {len([s for s in sections_with_content if s['content']])}", file=sys.stderr)
     return sections_with_content

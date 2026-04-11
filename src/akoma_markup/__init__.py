@@ -12,7 +12,7 @@ from .parser import (
     filter_sections_by_chapters,
     parse_toc,
 )
-from .writer import write_markup, write_metadata
+from .writer import write_markup, write_metadata, write_ocr_text
 
 
 def convert(
@@ -86,8 +86,10 @@ def convert(
         conv["chapter_heading"] = orig.get("chapter_heading", "Unknown")
 
     # 6. Write output
+    ocr_path = write_ocr_text(raw_text, output_path)
     markup_path = write_markup(converted, output_path)
     meta_path = write_metadata(converted, errors, output_path)
+    print(f"OCR text written to {ocr_path}", file=sys.stderr)
 
     print(f"Markup written to {markup_path}", file=sys.stderr)
     print(f"Metadata written to {meta_path}", file=sys.stderr)

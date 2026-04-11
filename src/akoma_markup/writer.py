@@ -5,6 +5,24 @@ from datetime import datetime
 from pathlib import Path
 
 
+def write_ocr_text(text: str, output_path: str) -> str:
+    """Write the raw OCR text to a file alongside the markup output.
+
+    Args:
+        text: The full extracted OCR text from the PDF.
+        output_path: Path to the markup file (OCR text is written next to it).
+
+    Returns:
+        The OCR text file path.
+    """
+    ocr_path = Path(output_path).with_suffix(".ocr.txt")
+    vma_path = Path(output_path).with_suffix(".vma.txt")
+
+    ocr_path.write_text(text, encoding="utf-8")
+
+    return str(ocr_path)
+
+
 def write_markup(sections: list[dict], output_path: str) -> str:
     """Write converted sections to a markup text file grouped by chapter.
 
@@ -58,6 +76,7 @@ def write_metadata(
         "sections_converted": len(sections),
         "chapters": len({sec.get("chapter_roman", "NA") for sec in sections}),
         "errors": len(errors),
+        "ocr_file": str(Path(output_path).with_suffix(".ocr.txt")),
     }
 
     with open(meta_path, "w") as f:
