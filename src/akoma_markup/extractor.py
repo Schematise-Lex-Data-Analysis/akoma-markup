@@ -1,4 +1,4 @@
-"""PDF text extraction for BNSS 2023 documents."""
+"""PDF text extraction for indiacode 2023 law documents."""
 
 import pdfplumber
 

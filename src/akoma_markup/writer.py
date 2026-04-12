@@ -16,10 +16,7 @@ def write_ocr_text(text: str, output_path: str) -> str:
         The OCR text file path.
     """
     ocr_path = Path(output_path).with_suffix(".ocr.txt")
-    vma_path = Path(output_path).with_suffix(".vma.txt")
-
     ocr_path.write_text(text, encoding="utf-8")
-
     return str(ocr_path)
 
 
@@ -55,6 +52,9 @@ def write_metadata(
     sections: list[dict],
     errors: list[dict],
     output_path: str,
+    document_name: str | None = None,
+    act_number: str | None = None,
+    replaces: str | None = None,
 ) -> str:
     """Write conversion metadata JSON alongside the markup file.
 
@@ -62,6 +62,9 @@ def write_metadata(
         sections: Successfully converted sections.
         errors: Sections that failed conversion.
         output_path: Path to the markup file (metadata is written next to it).
+        document_name: Name of the document.
+        act_number: Act number.
+        replaces: Previous act this document replaces.
 
     Returns:
         The metadata file path.
@@ -69,15 +72,20 @@ def write_metadata(
     meta_path = Path(output_path).with_suffix(".meta.json")
 
     metadata = {
-        "document": "Bharatiya Nagarik Suraksha Sanhita 2023",
-        "act_number": "46 of 2023",
-        "replaces": "Criminal Procedure Code (CrPC) 1973",
         "conversion_date": datetime.now().isoformat(),
         "sections_converted": len(sections),
         "chapters": len({sec.get("chapter_roman", "NA") for sec in sections}),
         "errors": len(errors),
         "ocr_file": str(Path(output_path).with_suffix(".ocr.txt")),
     }
+
+    # Add document metadata if provided
+    if document_name:
+        metadata["document"] = document_name
+    if act_number:
+        metadata["act_number"] = act_number
+    if replaces:
+        metadata["replaces"] = replaces
 
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)

@@ -1,8 +1,10 @@
-"""TOC and section parsing for BNSS 2023 documents."""
+"""TOC and section parsing for legislative documents."""
 
 import difflib
+import logging
 import re
-import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _heading_similarity(heading1: str, heading2: str) -> float:
@@ -21,8 +23,9 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
         <CHAPTER TITLE IN CAPS>
         <num>. <Section name>.
 
-    Scanning stops when the first chapter's roman numeral is encountered a
-    second time, which signals the start of the body text.
+    Scanning stops when a CHAPTER/PART heading is encountered that was
+    already seen earlier in the TOC, which signals the start of body text.
+    This works regardless of numeral style (roman, arabic, letter).
 
     Args:
         lines: All lines from the extracted PDF text.
@@ -31,39 +34,35 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
         Tuple of (chapters, sections, toc_end_line) where toc_end_line is the
         index of the last TOC entry found.
     """
-    print("[DEBUG] Starting TOC parsing...", file=sys.stderr)
-    print(f"[DEBUG] Total lines to parse: {len(lines)}", file=sys.stderr)
     chapters = []
     sections = []
     toc_end_line = 0
-    first_chapter = None
+    seen_headings: set[str] = set()
 
     i = 0
     while i < len(lines):
         line = lines[i].strip()
 
-        # Check for body text start: CHAPTER 1 (Arabic numeral indicates body, not TOC)
-        if re.match(r"^CHAPTER\s+1$", line) and first_chapter == "I":
-            print(f"[DEBUG] Breaking TOC scan at line {i}: found CHAPTER 1 (body text start)", file=sys.stderr)
-            break
+        # Detect any CHAPTER or PART line (roman, arabic, letter — any style).
+        # If its heading was already seen in the TOC, the body has started.
+        if re.match(r"^(CHAPTER|PART)\s+.+$", line) and i + 1 < len(lines):
+            next_heading = lines[i + 1].strip()
+            if next_heading in seen_headings:
+                break
 
         chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
         if chapter_match:
             roman = chapter_match.group(1)
-            if first_chapter is not None and roman == first_chapter:
-                print(f"[DEBUG] Breaking TOC scan at line {i}: found CHAPTER {roman} again", file=sys.stderr)
-                break
-            if first_chapter is None:
-                first_chapter = roman
             if i + 1 < len(lines):
                 title = lines[i + 1].strip()
                 if title and title != "SECTIONS" and not title.isdigit():
                     chapters.append({"roman": roman, "heading": title})
+                    seen_headings.add(title)
             toc_end_line = i + 1
             i += 2
             continue
 
-        section_match = re.match(r"^(\d+[A-Za-z]?)\.\s+(.+?)\.?\s*$", line)
+        section_match = re.match(r"^(\d+[A-Za-z]*)\.\s+(.+?)\.?\s*$", line)
         if section_match:
             sections.append(
                 {"num": section_match.group(1), "heading": section_match.group(2)}
@@ -72,9 +71,6 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
 
         i += 1
 
-    print(f"[DEBUG] TOC parsing complete. Found {len(chapters)} chapters, {len(sections)} sections. TOC ends at line {toc_end_line}", file=sys.stderr)
-    print(f"[DEBUG] Chapters found: {[ch['roman'] for ch in chapters]}", file=sys.stderr)
-    print(f"[DEBUG] First 5 sections: {[s['num'] + '. ' + s['heading'] for s in sections[:5]]}", file=sys.stderr)
     validate_toc_sections(sections)
     return chapters, sections, toc_end_line
 
@@ -96,16 +92,14 @@ def validate_toc_sections(sections: list[dict]):
             gap_start = nums[i - 1] + 1
             gap_end = nums[i] - 1
             if gap_start == gap_end:
-                print(
-                    f"Warning: TOC missing section {gap_start} "
-                    f"(between {nums[i - 1]} and {nums[i]})",
-                    file=sys.stderr,
+                logger.warning(
+                    f"TOC missing section {gap_start} "
+                    f"(between {nums[i - 1]} and {nums[i]})"
                 )
             else:
-                print(
-                    f"Warning: TOC missing sections {gap_start}-{gap_end} "
-                    f"(between {nums[i - 1]} and {nums[i]})",
-                    file=sys.stderr,
+                logger.warning(
+                    f"TOC missing sections {gap_start}-{gap_end} "
+                    f"(between {nums[i - 1]} and {nums[i]})"
                 )
 
 
@@ -124,7 +118,6 @@ def extract_chapter_ranges(
     Returns:
         List of chapter dicts with 'roman', 'heading', 'start', 'end' keys.
     """
-    print("[DEBUG] Extracting chapter ranges...", file=sys.stderr)
     end = toc_end_line + 1 if toc_end_line is not None else len(toc_lines)
     chapter_ranges = []
     current_chapter = None
@@ -150,7 +143,7 @@ def extract_chapter_ranges(
             i += 2
             continue
 
-        section_match = re.match(r"^(\d+[A-Za-z]?)\.\s+", line)
+        section_match = re.match(r"^(\d+[A-Za-z]*)\.\s+", line)
         if section_match and current_chapter:
             num_match = re.match(r"(\d+)", section_match.group(1))
             if num_match:
@@ -163,7 +156,6 @@ def extract_chapter_ranges(
         current_chapter["end"] = max(chapter_sections)
         chapter_ranges.append(current_chapter)
 
-    print(f"[DEBUG] Chapter ranges extracted: {[(c['roman'], c.get('start'), c.get('end')) for c in chapter_ranges]}", file=sys.stderr)
     return chapter_ranges
 
 
@@ -237,14 +229,7 @@ def extract_section_content(
     Returns:
         List of section dicts with 'num', 'heading', and 'content' keys.
     """
-    print("[DEBUG] Starting section content extraction...", file=sys.stderr)
-    print(f"[DEBUG] Total sections to extract: {len(section_names)}", file=sys.stderr)
-    print(f"[DEBUG] Full document length (chars): {len(full_text)}", file=sys.stderr)
-    print("[DEBUG] === FULL DOCUMENT TEXT (for OCR verification) ===", file=sys.stderr)
-    print(full_text[:5000], file=sys.stderr)  # First 5000 chars to avoid overwhelming output
-    if len(full_text) > 5000:
-        print(f"[DEBUG] ... (truncated, total {len(full_text)} characters)", file=sys.stderr)
-    print("[DEBUG] === END DOCUMENT TEXT SAMPLE ===", file=sys.stderr)
+    logger.debug(f"Starting section content extraction for {len(section_names)} sections")
     sections_with_content = []
 
     for i, sec in enumerate(section_names):
@@ -284,18 +269,14 @@ def extract_section_content(
                 content = full_text[start_pos:start_pos + next_match.start()]
             else:
                 content = full_text[start_pos:]
-            match = re.match(r".*", content)  # Dummy match to reuse existing logic
-            match_content = content
         else:
-            match = None
-            match_content = None
+            content = None
 
-        if best_match and match_content is not None:
-            content = match_content.strip()
+        if best_match and content is not None:
+            content = content.strip()
             content = re.sub(r"\n\d+\n", "\n", content)
             content = re.sub(r"\d+\[", "[", content)
-            if i < 15:
-                print(f"[DEBUG] Section {sec_num} matched with similarity {best_similarity:.2%} - content length: {len(content)} chars", file=sys.stderr)
+            logger.debug(f"Section {sec_num} matched with similarity {best_similarity:.2%} - content length: {len(content)} chars")
             sections_with_content.append(
                 {"num": sec_num, "heading": sec["heading"], "content": content}
             )
@@ -303,11 +284,10 @@ def extract_section_content(
             fallback = "[Repealed/Omitted]" if (
                 "Repealed" in sec["heading"] or "Omitted" in sec["heading"]
             ) else ""
-            if i < 15:
-                print(f"[DEBUG] Section {sec_num} - NO CONTENT FOUND (tried {len(candidates)} candidates), using fallback: {fallback!r}", file=sys.stderr)
+            logger.debug(f"Section {sec_num} - NO CONTENT FOUND (tried {len(candidates)} candidates), using fallback: {fallback!r}")
             sections_with_content.append(
                 {"num": sec_num, "heading": sec["heading"], "content": fallback}
             )
 
-    print(f"[DEBUG] Section content extraction complete. Total sections with content: {len([s for s in sections_with_content if s['content']])}", file=sys.stderr)
+    logger.debug(f"Section content extraction complete. Total sections with content: {len([s for s in sections_with_content if s['content']])}")
     return sections_with_content

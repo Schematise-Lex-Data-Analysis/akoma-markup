@@ -1,4 +1,4 @@
-"""LLM-based conversion of BNSS sections to Akoma Ntoso markup."""
+"""LLM-based conversion of legislative sections to Akoma Ntoso markup."""
 
 import json
 import sys
@@ -10,11 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-CONVERSION_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """You are converting Bharatiya Nagarik Suraksha Sanhita (BNSS) 2023 sections to Laws.Africa plaintext markup format.
+CONVERSION_PROMPT_TEMPLATE = """You are converting {document_name} sections to Laws.Africa plaintext markup format.
 
 MARKUP RULES:
 1. Section format: SEC [num]. - [heading]
@@ -45,23 +41,18 @@ SEC 41. - When police may arrest without warrant
   Explanation.—For the purposes of this section...
 ```
 
-PRESERVE the exact legal text. Do not paraphrase or summarize.""",
-        ),
-        (
-            "human",
-            """Convert this BNSS section to Laws.Africa markup:
+PRESERVE the exact legal text. Do not paraphrase or summarize."""
+
+HUMAN_PROMPT_TEMPLATE = """Convert this section to Laws.Africa markup:
 
 Section Number: {section_num}
 Section Heading: {section_heading}
 Section Content:
 {section_content}
 
-Output ONLY the markup, no explanations:""",
-        ),
-    ]
-)
+Output ONLY the markup, no explanations:"""
 
-# Defaults matching the notebook's Azure AI S0 tier rate limiting.
+# Defaults matching the Azure AI S0 tier rate limiting.
 DEFAULT_RATE_CONFIG = {
     "delay_between_requests": 5,
     "batch_size": 3,
@@ -80,9 +71,24 @@ RETRYABLE_KEYWORDS = [
 ]
 
 
-def build_chain(llm: BaseChatModel):
-    """Create a LangChain chain from a chat model and the BNSS conversion prompt."""
-    return CONVERSION_PROMPT | llm | StrOutputParser()
+def build_chain(llm: BaseChatModel, document_name: str = "Legislative Document"):
+    """Create a LangChain chain from a chat model and the conversion prompt.
+
+    Args:
+        llm: The language model to use for conversion.
+        document_name: Name of the document being converted.
+
+    Returns:
+        A LangChain chain for converting sections to markup.
+    """
+    system_prompt = CONVERSION_PROMPT_TEMPLATE.format(document_name=document_name)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("human", HUMAN_PROMPT_TEMPLATE),
+        ]
+    )
+    return prompt | llm | StrOutputParser()
 
 
 def _load_checkpoint(path: Path) -> dict | None:

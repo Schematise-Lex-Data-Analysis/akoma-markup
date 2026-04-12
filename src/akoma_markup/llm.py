@@ -2,6 +2,9 @@
 
 import os
 
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_AZURE_MODEL = "Llama-3.3-70B-Instruct"
+
 
 def build_llm(config: dict):
     """Instantiate a LangChain chat model from a provider config.
@@ -50,12 +53,12 @@ def build_llm(config: dict):
                 "Provide api_key in config or set ANTHROPIC_API_KEY env var"
             )
         return ChatAnthropic(
-            model=model or "claude-sonnet-4-20250514",
+            model=model or DEFAULT_ANTHROPIC_MODEL,
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
         )
-# hugggingface
+
     if provider == "azure":
         try:
             from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
@@ -79,11 +82,13 @@ def build_llm(config: dict):
         return AzureAIChatCompletionsModel(
             endpoint=endpoint,
             credential=credential,
-            model=model or "Llama-3.3-70B-Instruct",
+            model=model or DEFAULT_AZURE_MODEL,
             temperature=temperature,
             max_tokens=max_tokens,
         )
 
+    # add support for huggingface provider
+    
     raise ValueError(
         f"Unknown provider '{provider}'. Supported: anthropic, azure"
     )

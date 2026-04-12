@@ -29,6 +29,7 @@ pip install -e ".[azure]"
 ```python
 from akoma_markup import convert
 
+# Basic usage
 result = convert(
     pdf_path="input_pdf.pdf",
     llm_config={
@@ -39,6 +40,24 @@ result = convert(
     output_path="output/bnss_markup.txt",
 )
 print(result)  # path to the markup file
+
+# With document metadata (recommended for proper identification)
+result = convert(
+    pdf_path="bnss_2023.pdf",
+    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    output_path="output/bnss_markup.txt",
+    document_name="Bharatiya Nagarik Suraksha Sanhita 2023",
+    act_number="46 of 2023",
+    replaces="Criminal Procedure Code (CrPC) 1973",
+)
+
+# For IT Act (no replaces field)
+result = convert(
+    pdf_path="IT_Act_2021.pdf",
+    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    document_name="Information Technology Act 2000",
+    act_number="21 of 2000",
+)
 ```
 
 ### As a CLI
@@ -95,9 +114,29 @@ When using `--llm-env`, the CLI reads `PROVIDER`, `AZURE_INFERENCE_ENDPOINT`,
 Running `convert` produces:
 
 - `<output>.txt` — the Akoma Ntoso plaintext markup
-- `<output>.meta.json` — per-section conversion status, errors, and chapter info
+- `<output>.meta.json` — per-section conversion status, errors, chapter info, and document metadata
+- `<output>.ocr.txt` — the raw OCR text extracted from the PDF
 - `<output-dir>/.akoma_checkpoints/` — intermediate per-section cache that lets
   a failed run resume without re-calling the LLM for already-converted sections
+
+### Metadata file structure
+
+The `.meta.json` file includes:
+
+```json
+{
+  "conversion_date": "2024-01-15T10:30:00",
+  "sections_converted": 531,
+  "chapters": 20,
+  "errors": 0,
+  "ocr_file": "output/bnss_markup.ocr.txt",
+  "document": "Bharatiya Nagarik Suraksha Sanhita 2023",
+  "act_number": "46 of 2023",
+  "replaces": "Criminal Procedure Code (CrPC) 1973"
+}
+```
+
+Note: `document`, `act_number`, and `replaces` are only included when provided.
 
 ## Project layout
 

@@ -1,4 +1,4 @@
-"""akoma-markup: Convert BNSS 2023 PDF to Akoma Ntoso markup."""
+"""akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
 import sys
 from pathlib import Path
@@ -19,15 +19,22 @@ def convert(
     pdf_path: str,
     llm_config: dict,
     output_path: str | None = None,
+    document_name: str | None = None,
+    act_number: str | None = None,
+    replaces: str | None = None,
 ) -> str:
-    """Convert a BNSS 2023 PDF to Akoma Ntoso markup.
+    """Convert a legislative PDF to Akoma Ntoso markup.
 
     Args:
-        pdf_path: Path to the BNSS PDF file.
+        pdf_path: Path to the legislative PDF file.
         llm_config: LLM provider config dict. Must include 'provider' key.
             Example: {"provider": "openai", "model": "gpt-4o", "api_key": "sk-..."}
         output_path: Destination for the markup file.
             Defaults to ``<pdf_stem>_markup.txt`` in the same directory.
+        document_name: Name of the document (e.g., "Bharatiya Nagarik Suraksha Sanhita 2023").
+            Defaults to PDF filename stem.
+        act_number: Act number (e.g., "46 of 2023").
+        replaces: Previous act this document replaces (e.g., "Criminal Procedure Code (CrPC) 1973").
 
     Returns:
         Path to the generated markup file.
@@ -38,6 +45,10 @@ def convert(
 
     if output_path is None:
         output_path = str(pdf.with_name(f"{pdf.stem}_markup.txt"))
+
+    # Set defaults for document metadata
+    if document_name is None:
+        document_name = pdf.stem
 
     llm = build_llm(llm_config)
 
@@ -72,7 +83,7 @@ def convert(
     print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
 
     # 5. Convert via LLM
-    chain = build_chain(llm)
+    chain = build_chain(llm, document_name=document_name)
     checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
     converted, errors = process_all_sections(
         chain, sections, checkpoint_dir=checkpoint_dir
@@ -88,7 +99,12 @@ def convert(
     # 6. Write output
     ocr_path = write_ocr_text(raw_text, output_path)
     markup_path = write_markup(converted, output_path)
-    meta_path = write_metadata(converted, errors, output_path)
+    meta_path = write_metadata(
+        converted, errors, output_path,
+        document_name=document_name,
+        act_number=act_number,
+        replaces=replaces
+    )
     print(f"OCR text written to {ocr_path}", file=sys.stderr)
 
     print(f"Markup written to {markup_path}", file=sys.stderr)
