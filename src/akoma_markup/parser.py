@@ -7,6 +7,41 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def preprocess_pdf_text(text: str) -> str:
+    """Pre-process PDF text to remove page break artifacts.
+
+    Removes common patterns that appear due to page breaks:
+    - Standalone page numbers (lines with just digits)
+    - Common headers like "THE GAZETTE OF INDIA", "EXTRAORDINARY", etc.
+    - Page number artifacts like "3[" which should be "["
+
+    Args:
+        text: Raw text extracted from PDF.
+
+    Returns:
+        Cleaned text with page artifacts removed.
+    """
+    # Remove lines that are just page numbers (standalone digits)
+    # This handles cases where page numbers appear on their own line
+    text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
+
+    # Remove common legislative document headers
+    header_patterns = [
+        r'THE GAZETTE OF INDIA\s*\n',
+        r'EXTRAORDINARY\s*\n',
+        r'PART \w+[-–—]\w+\s*\n',
+        r'Section \w+\s*\n',
+        r'\[.*\d{4}\]\s*\n',  # Lines like [No. 22 of 2021]
+    ]
+    for pattern in header_patterns:
+        text = re.sub(pattern, '\n', text, flags=re.IGNORECASE)
+
+    # Normalize multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
+
+
 def _heading_similarity(heading1: str, heading2: str) -> float:
     """Calculate fuzzy similarity ratio between two headings (0.0 to 1.0)."""
     # Normalize: lowercase, remove punctuation at end, extra spaces
@@ -62,12 +97,34 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
             i += 2
             continue
 
-        section_match = re.match(r"^(\d+[A-Za-z]*)\.\s+(.+?)\.?\s*$", line)
+        section_match = re.match(r"^(\d+[A-Za-z]*)\.\s+(.+)$", line)
         if section_match:
-            sections.append(
-                {"num": section_match.group(1), "heading": section_match.group(2)}
-            )
-            toc_end_line = i
+            sec_num = section_match.group(1)
+            sec_heading = section_match.group(2).strip()
+
+            # Handle multi-line titles: check if next line continues the heading
+            # (doesn't start with a number pattern or CHAPTER/PART)
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                # Stop if next line looks like a new section, chapter, or is empty
+                if not next_line:
+                    break
+                if re.match(r"^\d+[A-Za-z]*\.\s+", next_line):  # New section
+                    break
+                if re.match(r"^(CHAPTER|PART)\s+", next_line, re.IGNORECASE):
+                    break
+                # If it's all caps, might be a chapter title
+                if next_line.isupper() and len(next_line) > 10:
+                    break
+                # Otherwise, append to heading (with space)
+                sec_heading += " " + next_line
+                j += 1
+
+            # Clean up heading: remove trailing period if present
+            sec_heading = sec_heading.rstrip('.')
+            sections.append({"num": sec_num, "heading": sec_heading})
+            toc_end_line = j - 1 if j > i + 1 else i
 
         i += 1
 
@@ -213,14 +270,87 @@ def filter_sections_by_chapters(
     return filtered
 
 
+def _find_section_boundary(text: str, sec_num: str, sec_heading: str) -> tuple[int | None, int | None]:
+    """Find the start and end positions of a section using string-based fencing.
+
+    Uses fuzzy matching to identify the correct section header, then fences
+    the content between this section and the next one. Now also supports
+    heading-based matching when section numbers are ambiguous or missing.
+
+    Args:
+        text: Full text to search in.
+        sec_num: Section number to find (e.g., "11", "67A").
+        sec_heading: Expected heading for validation.
+
+    Returns:
+        Tuple of (start_pos, end_pos) where content should be extracted from,
+        or (None, None) if not found.
+    """
+    # Pattern to find section number followed by heading text
+    # More flexible: handles various dash types and spacing
+    patterns = [
+        rf"\n{re.escape(sec_num)}\.\s*([^\n—–\-]*)",  # Until newline or dash
+        rf"\n{re.escape(sec_num)}\.\s*([^\n]*)",       # Until just newline
+    ]
+
+    candidates = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            cand_heading = match.group(1).strip()
+            # Skip footnotes
+            if re.match(r"^(Ins\.|Subs\.|The\.|Certain|A\s|Sub\.|Omitted)", cand_heading, re.IGNORECASE):
+                continue
+            similarity = _heading_similarity(sec_heading, cand_heading)
+            candidates.append((match, similarity))
+
+    # Check if we have good number-based matches
+    best_num_similarity = max((sim for _, sim in candidates), default=0.0)
+
+    # If no good number-based matches, try heading-based matching
+    if not candidates or best_num_similarity < 0.8:
+        logger.debug(f"Section {sec_num}: Trying heading-based fallback for '{sec_heading[:50]}...'")
+
+        # Search for the heading text on its own line (possibly with section number)
+        # This catches cases like "Definitions" or "1. Definitions" or "1 Definitions"
+        heading_variants = [
+            rf"\n{re.escape(sec_heading)}\s*\n",  # Heading on its own line
+            rf"\n{re.escape(sec_heading)}\s*[—–\-]",  # Heading followed by dash
+            rf"\n\d+\.?\s*{re.escape(sec_heading)}\s*\n",  # Number + heading variant
+        ]
+
+        for pattern in heading_variants:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                matched_text = match.group(0).strip()
+                # Extract just the heading part for comparison
+                heading_match = re.search(r"[A-Za-z].*", matched_text)
+                if heading_match:
+                    cand_heading = heading_match.group(0).strip()
+                    similarity = _heading_similarity(sec_heading, cand_heading)
+                    if similarity >= 0.9:  # High threshold for heading-only matches
+                        logger.debug(f"Section {sec_num}: Found via heading match (sim={similarity:.2f})")
+                        return match.start(), match.end()
+
+    if not candidates:
+        return None, None
+
+    # Sort by similarity and return best match
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best_match, best_similarity = candidates[0]
+
+    if best_similarity < 0.90:
+        return None, None
+
+    return best_match.start(), best_match.end()
+
+
 def extract_section_content(
     full_text: str, section_names: list[dict]
 ) -> list[dict]:
-    """Extract section content from the main body text.
+    """Extract section content from the main body text using string-based fencing.
 
-    Matches each section by its number (e.g. ``42.``) and captures everything
-    until the next section number begins.  Does not rely on heading text or
-    dash characters, making it resilient to formatting variations across PDFs.
+    Uses the ToC's ordered section list to fence boundaries reliably by
+    searching for literal section number strings in the text. This handles
+    page breaks better than pure regex approaches.
 
     Args:
         full_text: Full text of the PDF (post-TOC portion).
@@ -230,64 +360,85 @@ def extract_section_content(
         List of section dicts with 'num', 'heading', and 'content' keys.
     """
     logger.debug(f"Starting section content extraction for {len(section_names)} sections")
+
+    # Pre-process text to handle page artifacts
+    full_text = preprocess_pdf_text(full_text)
+
     sections_with_content = []
 
     for i, sec in enumerate(section_names):
         sec_num = sec["num"]
         sec_heading = sec["heading"]
 
-        if i + 1 < len(section_names):
-            next_sec_num = section_names[i + 1]["num"]
-            stop_pattern = rf"\n{next_sec_num}\."
-        else:
-            stop_pattern = r"\Z"
+        # Find the start of this section
+        start_match_pos, _ = _find_section_boundary(full_text, sec_num, sec_heading)
 
-        # Find all candidate positions for this section number
-        # Pattern: section number followed by text until emdash, newline, or end
-        candidate_pattern = rf"\n{re.escape(sec_num)}\.\s+([^\n—–\-]+)"
-        candidates = list(re.finditer(candidate_pattern, full_text))
+        if start_match_pos is None:
+            # Try fuzzy fallback
+            logger.debug(f"Section {sec_num}: Primary search failed, trying fallback")
+            fallback_pattern = rf"\n{re.escape(sec_num)}\.\s+(.+?)(?:\n|$)"
+            fallback_match = re.search(fallback_pattern, full_text)
+            if fallback_match:
+                start_match_pos = fallback_match.start()
+                logger.debug(f"Section {sec_num}: Found via fallback")
 
-        best_match = None
-        best_similarity = 0.0
-        for cand in candidates:
-            # Extract the heading part from candidate (before emdash/newline)
-            cand_heading = cand.group(1).strip()
-            # Skip footnotes like "3. Ins. by Act..." or "3. Subs. by..."
-            if re.match(r"^(Ins\.|Subs\.|The\.|Certain|A\s|Sub\.|Omitted)", cand_heading, re.IGNORECASE):
-                continue
-            similarity = _heading_similarity(sec_heading, cand_heading)
-            if similarity > best_similarity and similarity >= 0.90:
-                best_similarity = similarity
-                best_match = cand
-
-        if best_match:
-            # Now extract the full content from this position until next section
-            start_pos = best_match.end()
-            # Find where next section starts
-            next_match = re.search(stop_pattern, full_text[start_pos:])
-            if next_match:
-                content = full_text[start_pos:start_pos + next_match.start()]
-            else:
-                content = full_text[start_pos:]
-        else:
-            content = None
-
-        if best_match and content is not None:
-            content = content.strip()
-            content = re.sub(r"\n\d+\n", "\n", content)
-            content = re.sub(r"\d+\[", "[", content)
-            logger.debug(f"Section {sec_num} matched with similarity {best_similarity:.2%} - content length: {len(content)} chars")
-            sections_with_content.append(
-                {"num": sec_num, "heading": sec["heading"], "content": content}
-            )
-        else:
+        if start_match_pos is None:
+            # Section not found
             fallback = "[Repealed/Omitted]" if (
                 "Repealed" in sec["heading"] or "Omitted" in sec["heading"]
             ) else ""
-            logger.debug(f"Section {sec_num} - NO CONTENT FOUND (tried {len(candidates)} candidates), using fallback: {fallback!r}")
+            logger.debug(f"Section {sec_num}: NO CONTENT FOUND, using fallback: {fallback!r}")
             sections_with_content.append(
                 {"num": sec_num, "heading": sec["heading"], "content": fallback}
             )
+            continue
+
+        # Find the end: search for the next section's number in the text
+        # Use string-based fencing - literally search for next section number
+        end_pos = None
+        if i + 1 < len(section_names):
+            next_sec_num = section_names[i + 1]["num"]
+            next_sec_heading = section_names[i + 1]["heading"]
+
+            # Search for next section starting from current section's position
+            search_start = start_match_pos + len(sec_num) + 2  # Skip past current section header
+            remaining_text = full_text[search_start:]
+
+            # Try to find next section using the same boundary detection
+            next_start_rel, _ = _find_section_boundary(remaining_text, next_sec_num, next_sec_heading)
+
+            if next_start_rel is not None:
+                end_pos = search_start + next_start_rel
+            else:
+                # Fallback: simple pattern match for next section
+                next_pattern = rf"\n{re.escape(next_sec_num)}\.\s"
+                next_match = re.search(next_pattern, remaining_text)
+                if next_match:
+                    end_pos = search_start + next_match.start()
+
+        # Extract content
+        if end_pos is not None:
+            content = full_text[start_match_pos:end_pos]
+        else:
+            content = full_text[start_match_pos:]
+
+        # Clean up content
+        content = content.strip()
+
+        # Remove section header line from content (keep only the body)
+        content_lines = content.split('\n')
+        if len(content_lines) > 1:
+            # First line is the header, rest is content
+            content = '\n'.join(content_lines[1:]).strip()
+
+        # Final cleanup
+        content = re.sub(r"\n\d+\n", "\n", content)
+        content = re.sub(r"\d+\[", "[", content)
+
+        logger.debug(f"Section {sec_num}: Extracted {len(content)} chars")
+        sections_with_content.append(
+            {"num": sec_num, "heading": sec["heading"], "content": content}
+        )
 
     logger.debug(f"Section content extraction complete. Total sections with content: {len([s for s in sections_with_content if s['content']])}")
     return sections_with_content
