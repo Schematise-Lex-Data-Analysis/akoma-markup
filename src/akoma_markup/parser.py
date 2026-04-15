@@ -355,7 +355,7 @@ def _find_section_boundary(
     
     # Simple pattern: section number followed by period and text until newline or end
     # This is much faster than the similarity search
-    simple_pattern = rf"\n{re.escape(sec_num)}\.\s+(.+?)(?:\n|$)"
+    simple_pattern = rf"{re.escape(sec_num)}\.\s+(.+?)(?:\n|$)"
     simple_match = re.search(simple_pattern, text[search_start:])
     
     if simple_match:
@@ -383,7 +383,7 @@ def _find_section_boundary(
     # Pattern: digit + optional letters, dot, whitespace, any characters, followed by dash
     # This captures patterns like "1. Definitions —", "12. Some heading -", "1A. Heading —"
     # WITH re.DOTALL: . matches newlines, allowing multi-line headings
-    similarity_pattern = rf"\n(\d+[A-Za-z]*\.\s*.+?)[—–\-]"
+    similarity_pattern = rf"(\d+[A-Za-z]*\.\s*.+?)[—–]"
 
     candidates = []
     for match in re.finditer(similarity_pattern, search_text, flags=re.DOTALL):

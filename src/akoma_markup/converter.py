@@ -113,7 +113,7 @@ def _save_checkpoint(path: Path, last_index: int, results: list, total: int):
 def process_all_sections(
     chain,
     sections: list[dict],
-    checkpoint_dir: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
     rate_config: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Process all sections through the LLM chain with rate limiting and checkpointing.
@@ -121,7 +121,7 @@ def process_all_sections(
     Args:
         chain: LangChain chain returned by ``build_chain``.
         sections: List of section dicts with 'num', 'heading', 'content'.
-        checkpoint_dir: Directory for checkpoint files. ``None`` disables checkpointing.
+        checkpoint_path: Full path to checkpoint file. ``None`` disables checkpointing.
         rate_config: Override default rate-limiting settings.
 
     Returns:
@@ -135,11 +135,7 @@ def process_all_sections(
     errors: list[dict] = []
     start_index = 0
 
-    checkpoint_path = (
-        Path(checkpoint_dir) / "conversion_checkpoint.json"
-        if checkpoint_dir
-        else None
-    )
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
 
     if checkpoint_path:
         cp = _load_checkpoint(checkpoint_path)
