@@ -14,6 +14,19 @@ from .parser import (
 )
 from .writer import write_markup, write_metadata, write_ocr_text
 
+# Azure AI services (optional)
+try:
+    from .table_ocr_ai import (
+        AzureOCR,
+        AzureMultimodalAnalyzer,
+        IndiaCodeAnalyzer,
+        extract_indiacode_tables,
+        test_azure_connectivity
+    )
+    AZURE_AI_AVAILABLE = True
+except ImportError:
+    AZURE_AI_AVAILABLE = False
+
 
 def convert(
     pdf_path: str,
@@ -135,3 +148,73 @@ def convert(
         print(f"{len(errors)} sections failed conversion", file=sys.stderr)
 
     return markup_path
+
+
+# Azure AI analysis functions
+if AZURE_AI_AVAILABLE:
+    
+    def analyze_indiacode_tables(
+        pdf_path: str,
+        api_key: str,
+        output_dir: str | None = None,
+        analysis_types: list[str] | None = None
+    ) -> dict:
+        """
+        Analyze IndiaCode legislative tables using Azure AI services.
+        
+        Args:
+            pdf_path: Path to PDF file
+            api_key: Azure API key
+            output_dir: Directory for output files
+            analysis_types: List of analysis types (summary, structure, content, json)
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        if analysis_types is None:
+            analysis_types = ["summary", "structure", "content"]
+        
+        return extract_indiacode_tables(
+            pdf_path=pdf_path,
+            api_key=api_key,
+            output_dir=output_dir
+        )
+    
+    def extract_with_document_intelligence(
+        pdf_path: str,
+        api_key: str,
+        output_dir: str | None = None
+    ) -> str:
+        """
+        Extract text from PDF using Azure Document Intelligence (OCR).
+        
+        Args:
+            pdf_path: Path to PDF file
+            api_key: Azure API key
+            output_dir: Directory to save extracted text
+            
+        Returns:
+            Path to extracted text file
+        """
+        from pathlib import Path
+        
+        pdf_path_obj = Path(pdf_path)
+        if output_dir:
+            output_dir_obj = Path(output_dir)
+        else:
+            output_dir_obj = pdf_path_obj.parent
+        
+        ocr = AzureOCR(api_key=api_key)
+        return str(ocr.extract_and_save(pdf_path_obj, output_dir_obj))
+    
+    def test_azure_ai_services(api_key: str) -> bool:
+        """
+        Test connectivity to Azure AI services.
+        
+        Args:
+            api_key: Azure API key
+            
+        Returns:
+            True if services are accessible
+        """
+        return test_azure_connectivity(api_key)
