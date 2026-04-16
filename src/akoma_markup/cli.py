@@ -69,7 +69,7 @@ def _config_from_env(env_path: str) -> dict:
     help="Path to a .env file with LLM credentials.",
 )
 def main(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path):
-    """Convert a BNSS 2023 PDF to Akoma Ntoso markup."""
+    """Convert a indiacode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:
         raise click.ClickException("Provide one of: --llm-inline, --llm-json, or --llm-env")

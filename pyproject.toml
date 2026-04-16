@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "akoma-markup"
 version = "0.1.0"
-description = "Convert BNSS 2023 PDF to Akoma Ntoso / Laws.Africa plaintext markup using any LangChain LLM."
+description = "Convert legislative PDFs (from indiacode.nic.in) to Akoma Ntoso / Laws.Africa plaintext markup using any LangChain LLM."
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
