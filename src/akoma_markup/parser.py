@@ -450,8 +450,9 @@ def extract_section_content(
         sec_heading = sec["heading"]
 
         # Find the start of this section, beginning search after last processed boundary
-        start_result = _find_section_boundary(full_text, sec_num, sec_heading, last_processed_boundary)
-        start_match_pos, end_idx, start_context = start_result
+        start_match_pos, end_idx, _ = _find_section_boundary(
+            full_text, sec_num, sec_heading, last_processed_boundary
+        )
 
         if start_match_pos is None:
             # Section not found
@@ -471,14 +472,14 @@ def extract_section_content(
         # Find the end: search for the next section's number in the text
         # Use string-based fencing - literally search for next section number
         end_pos = None
-        end_context = None
         if i + 1 < len(section_names):
             next_sec_num = section_names[i + 1]["num"]
             next_sec_heading = section_names[i + 1]["heading"]
 
             # Search for next section starting from current section's boundary
-            next_result = _find_section_boundary(full_text, next_sec_num, next_sec_heading, last_processed_boundary)
-            next_start_abs, _, end_context = next_result
+            next_start_abs, _, _ = _find_section_boundary(
+                full_text, next_sec_num, next_sec_heading, last_processed_boundary
+            )
 
             if next_start_abs is not None:
                 end_pos = next_start_abs
@@ -497,14 +498,6 @@ def extract_section_content(
 
         # Clean up content
         content = content.strip()
-
-        # Remove section header line from content (keep only the body)
-        # content_lines = content.split('\n')
-        # if len(content_lines) > 1:
-        #    # First line is the header, rest is content
-        #    content = '\n'.join(content_lines[1:]).strip()
-
-        # Final cleanup
         content = re.sub(r"\n\d+\n", "\n", content)
         content = re.sub(r"\d+\[", "[", content)
 

@@ -1,12 +1,19 @@
 """Build a LangChain chat model from a config dict."""
 
+from __future__ import annotations
+
 import os
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from langchain_core.language_models import BaseChatModel
 
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 DEFAULT_AZURE_MODEL = "Llama-3.3-70B-Instruct"
 
 
-def build_llm(config: dict):
+def build_llm(config: dict[str, str | int | float | None]) -> "BaseChatModel":
     """Instantiate a LangChain chat model from a provider config.
 
     Args:
