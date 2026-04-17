@@ -9,6 +9,7 @@ from pathlib import Path
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
 
 CONVERSION_PROMPT_TEMPLATE = """You are converting {document_name} sections to Laws.Africa plaintext markup format.
 
@@ -71,7 +72,9 @@ RETRYABLE_KEYWORDS = [
 ]
 
 
-def build_chain(llm: BaseChatModel, document_name: str = "Legislative Document"):
+def build_chain(
+    llm: BaseChatModel, document_name: str = "Legislative Document"
+) -> Runnable[dict[str, str], str]:
     """Create a LangChain chain from a chat model and the conversion prompt.
 
     Args:
@@ -91,14 +94,14 @@ def build_chain(llm: BaseChatModel, document_name: str = "Legislative Document")
     return prompt | llm | StrOutputParser()
 
 
-def _load_checkpoint(path: Path) -> dict | None:
+def _load_checkpoint(path: Path) -> dict[str, list[dict] | int | str] | None:
     if path.exists():
         with open(path) as f:
             return json.load(f)
     return None
 
 
-def _save_checkpoint(path: Path, last_index: int, results: list, total: int):
+def _save_checkpoint(path: Path, last_index: int, results: list[dict], total: int) -> None:
     data = {
         "last_completed_index": last_index,
         "completed_sections": results,
@@ -111,17 +114,17 @@ def _save_checkpoint(path: Path, last_index: int, results: list, total: int):
 
 
 def process_all_sections(
-    chain,
-    sections: list[dict],
+    chain: Runnable[dict[str, str], str],
+    sections: list[dict[str, str]],
     checkpoint_path: str | Path | None = None,
-    rate_config: dict | None = None,
-) -> tuple[list[dict], list[dict]]:
+    rate_config: dict[str, int] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Process all sections through the LLM chain with rate limiting and checkpointing.
 
     Args:
         chain: LangChain chain returned by ``build_chain``.
         sections: List of section dicts with 'num', 'heading', 'content'.
-        checkpoint_path: Full path to checkpoint file. ``None`` disables checkpointing.
+        checkpoint_path: Full path to the checkpoint JSON file. ``None`` disables checkpointing.
         rate_config: Override default rate-limiting settings.
 
     Returns:
@@ -147,8 +150,6 @@ def process_all_sections(
                 file=sys.stderr,
             )
 
-    section_times: list[float] = []
-
     for i in range(start_index, len(sections)):
         section = sections[i]
         retry_count = 0
@@ -166,9 +167,6 @@ def process_all_sections(
                 results.append({"num": section["num"], "markup": result})
                 success = True
 
-                elapsed = time.time()
-                section_times.append(elapsed)
-                remaining = len(sections) - (i + 1)
                 pct = ((i + 1) / len(sections)) * 100
                 print(
                     f"[{i + 1}/{len(sections)} {pct:.0f}%] Section {section['num']}: "

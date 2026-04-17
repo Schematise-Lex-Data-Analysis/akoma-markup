@@ -1,12 +1,11 @@
 """CLI entrypoint for akoma-markup."""
 
 import json
-import os
 
 import click
 
 
-def _config_from_env(env_path: str) -> dict:
+def _config_from_env(env_path: str) -> dict[str, str | None]:
     """Build an LLM config dict from a .env file."""
     env_vars = {}
     with open(env_path) as f:
@@ -68,7 +67,13 @@ def _config_from_env(env_path: str) -> dict:
     default=None,
     help="Path to a .env file with LLM credentials.",
 )
-def main(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path):
+def main(
+    pdf_path: str,
+    output_path: str | None,
+    llm_inline: str | None,
+    llm_json_path: str | None,
+    llm_env_path: str | None,
+) -> None:
     """Convert a indiacode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:

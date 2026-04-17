@@ -1,4 +1,4 @@
-"""Test the akoma-markup package."""
+"""Demo: convert IT Act 2021 PDF to Akoma Ntoso markup."""
 
 from pathlib import Path
 
@@ -10,8 +10,8 @@ load_dotenv(env_path)
 
 from akoma_markup import convert
 
-PDF_PATH = Path(__file__).parent / "a202345.pdf"
-OUTPUT_PATH = Path(__file__).parent / "output" / "test_markup.txt"
+PDF_PATH = Path(__file__).parent / "IT_Act_2021.pdf"
+OUTPUT_PATH = Path(__file__).parent / "output" / "IT_Act_2021_markup.txt"
 
 
 def main():

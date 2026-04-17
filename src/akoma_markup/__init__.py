@@ -68,26 +68,12 @@ def convert(
     )
 
     # 3. Extract section content (skip TOC)
-    print(f"OCR text (raw): {all_lines[toc_end_line + 1:][:10]}", file=sys.stderr)
     content_text = "\n".join(all_lines[toc_end_line + 1:])
     sections = extract_section_content(content_text, section_names)
 
     # 4. Map sections to chapters and deduplicate
     sections = filter_sections_by_chapters(sections, chapter_ranges)
 
-    with open('/home/stns/akoma-markup/akoma-markup/sections_debug.tsv', 'a') as debug_file:
-        for sec in sections:
-            import csv
-            writer = csv.writer(debug_file, delimiter='\t')
-            # Truncate and sanitize content for readable debug output
-            content = sec.get('content', '[No content]')
-            #content_preview = content.replace('\n', ' ')[:200]
-            content_preview = content.replace('\n', ' ')
-            if len(content) > 200:
-                pass
-                #content_preview += '...'
-            writer.writerow([sec['num'], sec['heading'], content_preview])
-            print(f"Section debug: number={sec['num']}, heading={sec['heading']}", file=sys.stderr)
     seen = set()
     unique = []
     for sec in sections:
@@ -97,16 +83,13 @@ def convert(
     sections = unique
     print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
 
-    # Perform OCR text writing before LLM conversion
-    ocr_path = write_ocr_text(content_text, output_path)
-    print(f"OCR text written to {ocr_path}", file=sys.stderr)
-
     # 5. Convert via LLM
     chain = build_chain(llm, document_name=document_name)
-    checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_filename = f"{pdf.stem}_conversion_checkpoint.json"
-    checkpoint_path = checkpoint_dir / checkpoint_filename
+    checkpoint_path = (
+        Path(output_path).parent
+        / ".akoma_checkpoints"
+        / f"{pdf.stem}_conversion_checkpoint.json"
+    )
     converted, errors = process_all_sections(
         chain, sections, checkpoint_path=checkpoint_path
     )
@@ -127,8 +110,7 @@ def convert(
         act_number=act_number,
         replaces=replaces
     )
-    #print(f"OCR text written to {ocr_path}", file=sys.stderr)
-
+    print(f"OCR text written to {ocr_path}", file=sys.stderr)
     print(f"Markup written to {markup_path}", file=sys.stderr)
     print(f"Metadata written to {meta_path}", file=sys.stderr)
     if errors:
