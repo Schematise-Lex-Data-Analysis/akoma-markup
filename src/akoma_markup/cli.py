@@ -112,7 +112,33 @@ def main():
     default=None,
     help="Path to a .env file with LLM credentials.",
 )
-def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path):
+@click.option(
+    "--table-mode",
+    type=click.Choice(["declared", "heuristic", "full"]),
+    default=None,
+    help="Enable Azure-OCR-based table rescue. Off by default.",
+)
+@click.option(
+    "--table-pages",
+    type=str,
+    default=None,
+    help='Comma/range page list, e.g. "10,12-15". Required with --table-mode=declared.',
+)
+@click.option(
+    "--azure-api-key",
+    type=str,
+    default=None,
+    help="Azure API key for table OCR. Falls back to AZURE_API_KEY env var.",
+)
+@click.option(
+    "--azure-ocr-endpoint",
+    type=str,
+    default=None,
+    help="Override Azure Document Intelligence endpoint. "
+         "Falls back to AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT env var.",
+)
+def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
+            table_mode, table_pages, azure_api_key, azure_ocr_endpoint):
     """Convert a IndiaCode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:
@@ -131,9 +157,69 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path):
         except json.JSONDecodeError as exc:
             raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
 
+    parsed_table_pages = None
+    if table_mode is not None:
+        from .tables import parse_page_spec
+
+        if table_mode == "declared":
+            if not table_pages:
+                raise click.ClickException(
+                    "--table-mode=declared requires --table-pages"
+                )
+            try:
+                parsed_table_pages = parse_page_spec(table_pages)
+            except ValueError as exc:
+                raise click.ClickException(f"Invalid --table-pages: {exc}")
+        elif table_pages:
+            raise click.ClickException(
+                f"--table-pages is only valid with --table-mode=declared "
+                f"(got --table-mode={table_mode})"
+            )
+
+        env_file_vars: dict[str, str] = {}
+        if llm_env_path:
+            with open(llm_env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key, _, value = line.partition("=")
+                    env_file_vars[key.strip()] = value.strip().strip('"').strip("'")
+
+        resolved_api_key = (
+            azure_api_key
+            or env_file_vars.get("AZURE_API_KEY")
+            or os.environ.get("AZURE_API_KEY")
+        )
+        if not resolved_api_key:
+            raise click.ClickException(
+                "--table-mode requires --azure-api-key, "
+                "AZURE_API_KEY in --llm-env, or AZURE_API_KEY env var"
+            )
+        resolved_ocr_endpoint = (
+            azure_ocr_endpoint
+            or env_file_vars.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+            or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+        )
+    else:
+        resolved_api_key = None
+        resolved_ocr_endpoint = None
+        if table_pages:
+            raise click.ClickException(
+                "--table-pages requires --table-mode=declared"
+            )
+
     from . import convert as convert_func
 
-    result = convert_func(pdf_path, llm_config=config, output_path=output_path)
+    result = convert_func(
+        pdf_path,
+        llm_config=config,
+        output_path=output_path,
+        table_mode=table_mode,
+        table_pages=parsed_table_pages,
+        azure_api_key=resolved_api_key,
+        azure_ocr_endpoint=resolved_ocr_endpoint,
+    )
     click.echo(result)
 
 
@@ -159,18 +245,22 @@ try:
                   default=None,
                   help="Path to a .env file with Azure AI credentials")
     @click.option("--api-key", help="Azure API key (default: AZURE_API_KEY env var)")
-    @click.option("--multimodal-endpoint", 
+    @click.option("--multimodal-endpoint",
                   help="Multimodal AI endpoint (default: AZURE_MULTIMODAL_ENDPOINT env var)")
-    def test(llm_env_path: str, api_key: str, multimodal_endpoint: str):
+    @click.option("--multimodal-deployment",
+                  help="Multimodal deployment name (default: AZURE_MULTIMODAL_DEPLOYMENT env var)")
+    def test(llm_env_path: str, api_key: str, multimodal_endpoint: str, multimodal_deployment: str):
         """Test connectivity to Azure AI services."""
         # Configuration precedence: llm-env > command-line args > environment variables
         if llm_env_path:
             config = _azure_ai_config_from_env(llm_env_path)
             actual_api_key = config["api_key"]
             actual_multimodal_endpoint = config.get("multimodal_endpoint", multimodal_endpoint)
+            actual_multimodal_deployment = config.get("multimodal_deployment", multimodal_deployment)
         else:
             actual_api_key = api_key or os.environ.get("AZURE_API_KEY")
             actual_multimodal_endpoint = multimodal_endpoint or os.environ.get("AZURE_MULTIMODAL_ENDPOINT")
+            actual_multimodal_deployment = multimodal_deployment or os.environ.get("AZURE_MULTIMODAL_DEPLOYMENT")
         
         if not actual_api_key:
             raise click.ClickException(
@@ -208,10 +298,19 @@ try:
             raise click.ClickException(
                 "Azure API key required. Provide via --api-key or set AZURE_API_KEY environment variable."
             )
-        
+        actual_endpoint = (
+            document_intelligence_endpoint
+            or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+        )
+        if not actual_endpoint:
+            raise click.ClickException(
+                "Azure OCR endpoint required. Provide via --document-intelligence-endpoint "
+                "or set AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT environment variable."
+            )
+
         ocr_client = AzureOCR(
             api_key=actual_api_key,
-            endpoint=document_intelligence_endpoint
+            endpoint=actual_endpoint,
         )
         
         click.echo(f"📄 Extracting text from: {pdf_path.name}")

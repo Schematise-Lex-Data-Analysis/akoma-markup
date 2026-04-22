@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-azure = ["langchain-azure-ai"]
+azure = ["langchain-azure-ai", "langchain-openai", "pypdf>=4.0"]
 anthropic = ["langchain-anthropic"]
 
 [project.scripts]

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from .converter import build_chain, process_all_sections
-from .extractor import extract_pdf_text
+from .extractor import extract_pdf_pages, extract_pdf_text
 from .llm import build_llm
 from .parser import (
     extract_chapter_ranges,
@@ -35,6 +35,10 @@ def convert(
     document_name: str | None = None,
     act_number: str | None = None,
     replaces: str | None = None,
+    table_mode: str | None = None,
+    table_pages: list[int] | None = None,
+    azure_api_key: str | None = None,
+    azure_ocr_endpoint: str | None = None,
 ) -> str:
     """Convert a legislative PDF to Akoma Ntoso markup.
 
@@ -48,6 +52,13 @@ def convert(
             Defaults to PDF filename stem.
         act_number: Act number (e.g., "46 of 2023").
         replaces: Previous act this document replaces (e.g., "Criminal Procedure Code (CrPC) 1973").
+        table_mode: Optional table-rescue strategy. One of "declared", "heuristic", "full".
+            When None (default), only pdfplumber is used and tables in the PDF may be
+            garbled in the output. When set, table regions are additionally sent to
+            Azure OCR and converted to Laws.Africa TABLE blocks. Requires `azure_api_key`.
+        table_pages: 1-indexed page list. Required when `table_mode="declared"`.
+        azure_api_key: Azure API key. Required when `table_mode` is set.
+        azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
 
     Returns:
         Path to the generated markup file.
@@ -63,11 +74,38 @@ def convert(
     if document_name is None:
         document_name = pdf.stem
 
+    if table_mode is not None:
+        if table_mode not in {"declared", "heuristic", "full"}:
+            raise ValueError(
+                f"table_mode must be 'declared', 'heuristic', or 'full'; got {table_mode!r}"
+            )
+        if not azure_api_key:
+            raise ValueError("table_mode requires azure_api_key")
+        if table_mode == "declared" and not table_pages:
+            raise ValueError("table_mode='declared' requires table_pages")
+
     llm = build_llm(llm_config)
 
-    # 1. Extract text
+    # 1. Extract text (per-page so table rescue can swap individual pages)
     print("Extracting text from PDF ...", file=sys.stderr)
-    raw_text = extract_pdf_text(str(pdf))
+    per_page_text = extract_pdf_pages(str(pdf))
+
+    if table_mode is not None:
+        from .tables import rescue_tables
+        print(
+            f"Rescuing tables via Azure OCR (mode={table_mode!r}) ...",
+            file=sys.stderr,
+        )
+        per_page_text = rescue_tables(
+            pdf_path=pdf,
+            per_page_text=per_page_text,
+            mode=table_mode,
+            azure_api_key=azure_api_key,
+            table_pages=table_pages,
+            azure_ocr_endpoint=azure_ocr_endpoint,
+        )
+
+    raw_text = "\n".join(per_page_text)
     all_lines = raw_text.splitlines()
 
     # 2. Parse TOC
@@ -88,17 +126,13 @@ def convert(
     # 4. Map sections to chapters and deduplicate
     sections = filter_sections_by_chapters(sections, chapter_ranges)
 
-    with open('/home/stns/akoma-markup/akoma-markup/sections_debug.tsv', 'a') as debug_file:
+    debug_tsv_path = Path(output_path).with_suffix(".sections_debug.tsv")
+    with open(debug_tsv_path, 'a') as debug_file:
+        import csv
+        writer = csv.writer(debug_file, delimiter='\t')
         for sec in sections:
-            import csv
-            writer = csv.writer(debug_file, delimiter='\t')
-            # Truncate and sanitize content for readable debug output
             content = sec.get('content', '[No content]')
-            #content_preview = content.replace('\n', ' ')[:200]
             content_preview = content.replace('\n', ' ')
-            if len(content) > 200:
-                pass
-                #content_preview += '...'
             writer.writerow([sec['num'], sec['heading'], content_preview])
             print(f"Section debug: number={sec['num']}, heading={sec['heading']}", file=sys.stderr)
     seen = set()

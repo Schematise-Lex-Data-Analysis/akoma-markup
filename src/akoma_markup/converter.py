@@ -22,6 +22,13 @@ MARKUP RULES:
 7. Illustrations: Start with "Illustration" or "(a)", "(b)" as separate indented paragraphs
 8. Exceptions: Start with "Exception" as a separate indented paragraph
 9. Provisos: Start with "Provided that" as a separate indented paragraph
+10. Tables: if the section content contains a markdown table (pipe-delimited rows
+    with a "|---|" separator row between the header and body), convert it to a
+    bluebell TABLE block. Syntax is indentation-based (no closing keyword; the
+    block ends on dedent). Use TH for header-row cells, TC for body cells.
+    Indent the TABLE block to sit at its correct nesting level under the
+    enclosing SEC/SUBSEC/PARA. Preserve every cell verbatim — do not paraphrase,
+    merge, or reorder.
 
 EXAMPLE OUTPUT:
 ```
@@ -39,6 +46,40 @@ SEC 41. - When police may arrest without warrant
     Any officer in charge of a police station may...
 
   Explanation.—For the purposes of this section...
+```
+
+EXAMPLE WITH A TABLE (shows how to translate markdown table -> bluebell TABLE block):
+
+Input markdown table inside a section:
+```
+| Service     | Fee  |
+|-------------|------|
+| Application | ₹500 |
+| Renewal     | ₹250 |
+```
+
+Correct output placement:
+```
+SEC 10. - Fee schedule
+  SUBSEC (1)
+    The prescribed fees are as follows:
+
+    TABLE
+      TR
+        TH
+          Service
+        TH
+          Fee
+      TR
+        TC
+          Application
+        TC
+          ₹500
+      TR
+        TC
+          Renewal
+        TC
+          ₹250
 ```
 
 PRESERVE the exact legal text. Do not paraphrase or summarize."""
