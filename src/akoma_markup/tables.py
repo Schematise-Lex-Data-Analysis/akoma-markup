@@ -91,6 +91,12 @@ def _ocr_pages(pdf_path: Path, pages: list[int], ocr: AzureOCR) -> dict[int, str
                 file=sys.stderr,
             )
             per_page[p] = ocr.extract_text(single)
+            print(
+                f"[tables] --- OCR markdown for page {p} ---\n"
+                f"{per_page[p]}\n"
+                f"[tables] --- end page {p} ---",
+                file=sys.stderr,
+            )
         except Exception as exc:  # noqa: BLE001 — record and continue
             print(
                 f"[tables]   OCR failed for page {p}: {exc}",
@@ -127,7 +133,7 @@ def rescue_tables(
     azure_api_key: str,
     table_pages: list[int] | None = None,
     azure_ocr_endpoint: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict[int, str]]:
     """Produce a per-page text list where table-containing pages are re-extracted via OCR.
 
     Non-table pages stay as pdfplumber output; table pages are replaced with the
@@ -144,7 +150,11 @@ def rescue_tables(
         azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
 
     Returns:
-        New per-page list; table pages contain OCR markdown, everything else is unchanged.
+        Tuple of (per_page_text, rescued_pages). per_page_text has OCR markdown
+        spliced into rescued positions. rescued_pages maps 1-indexed page number
+        -> OCR markdown for each rescued page, so the caller can guarantee that
+        table content lands in the final output even if downstream section
+        extraction fails to absorb it.
     """
     ocr = AzureOCR(api_key=azure_api_key, endpoint=azure_ocr_endpoint)
 
@@ -159,7 +169,7 @@ def rescue_tables(
                 "[tables] heuristic: no tables detected by pdfplumber, skipping OCR",
                 file=sys.stderr,
             )
-            return per_page_text
+            return per_page_text, {}
         print(
             f"[tables] heuristic: found tables on pages {target_pages}",
             file=sys.stderr,
@@ -179,4 +189,4 @@ def rescue_tables(
     for page_num, md in ocr_markdown.items():
         result[page_num - 1] = md
 
-    return result
+    return result, ocr_markdown

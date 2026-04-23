@@ -1,5 +1,6 @@
 """akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
+import re
 import sys
 from pathlib import Path
 
@@ -90,13 +91,14 @@ def convert(
     print("Extracting text from PDF ...", file=sys.stderr)
     per_page_text = extract_pdf_pages(str(pdf))
 
+    rescued_pages: dict[int, str] = {}
     if table_mode is not None:
         from .tables import rescue_tables
         print(
             f"Rescuing tables via Azure OCR (mode={table_mode!r}) ...",
             file=sys.stderr,
         )
-        per_page_text = rescue_tables(
+        per_page_text, rescued_pages = rescue_tables(
             pdf_path=pdf,
             per_page_text=per_page_text,
             mode=table_mode,
@@ -143,6 +145,49 @@ def convert(
             unique.append(sec)
     sections = unique
     print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
+
+    # Guarantee rescued table content reaches the output. For every rescued
+    # page whose content didn't land in any extracted section, append a
+    # synthetic block. These flow through the normal LLM conversion so
+    # markdown tables still become bluebell TABLE blocks.
+    if rescued_pages:
+        all_section_content = "\n".join(s.get("content", "") for s in sections)
+        haystack = re.sub(r"\s+", " ", all_section_content).lower()
+        appended = 0
+        for page_num in sorted(rescued_pages):
+            md = rescued_pages[page_num]
+            stripped = md.strip()
+            if len(stripped) < 100:
+                continue  # nothing meaningful to preserve
+            mid = len(stripped) // 2
+            snippet_start = stripped.rfind(" ", max(0, mid - 40), mid) + 1
+            if snippet_start <= 0:
+                snippet_start = mid
+            snippet = stripped[snippet_start:snippet_start + 80]
+            snippet_norm = re.sub(r"\s+", " ", snippet).lower()
+            if snippet_norm and snippet_norm in haystack:
+                continue  # already absorbed by extract_section_content
+            sections.append(
+                {
+                    "num": f"page-{page_num}",
+                    "heading": f"Rescued content — page {page_num}",
+                    "content": md,
+                    "chapter_roman": "NA",
+                    "chapter_heading": "Rescued pages",
+                }
+            )
+            appended += 1
+            print(
+                f"Rescued page {page_num} not absorbed into any section; "
+                f"emitting as synthetic block ({len(md)} chars)",
+                file=sys.stderr,
+            )
+        if appended:
+            print(
+                f"{len(sections)} sections total after rescued-page placement "
+                f"(+{appended} synthetic)",
+                file=sys.stderr,
+            )
 
     # Perform OCR text writing before LLM conversion
     ocr_path = write_ocr_text(content_text, output_path)
