@@ -26,6 +26,7 @@ def _config_from_env(env_path: str) -> dict:
             "endpoint": env_vars.get("AZURE_INFERENCE_ENDPOINT"),
             "credential": env_vars.get("AZURE_INFERENCE_CREDENTIAL"),
             "model": env_vars.get("AZURE_MODEL_ID"),
+            "api_style": env_vars.get("AZURE_INFERENCE_API_STYLE"),
         }
     if "anthropic" in provider or env_vars.get("ANTHROPIC_API_KEY"):
         return {
@@ -114,9 +115,13 @@ def main():
 )
 @click.option(
     "--table-mode",
-    type=click.Choice(["declared", "heuristic", "full"]),
+    type=click.Choice(["declared", "auto", "full"]),
     default=None,
-    help="Enable Azure-OCR-based table rescue. Off by default.",
+    help="Enable Azure-OCR table rescue. "
+         "'declared' takes --table-pages. "
+         "'auto' uses a vision LLM to find table pages, then OCRs only those. "
+         "'full' OCRs every page (no detection step — most expensive but "
+         "guaranteed not to miss anything). Off by default.",
 )
 @click.option(
     "--table-pages",
@@ -137,8 +142,23 @@ def main():
     help="Override Azure Document Intelligence endpoint. "
          "Falls back to AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT env var.",
 )
+@click.option(
+    "--azure-multimodal-endpoint",
+    type=str,
+    default=None,
+    help="Vision-LLM endpoint for --table-mode=auto. "
+         "Falls back to AZURE_MULTIMODAL_ENDPOINT env var.",
+)
+@click.option(
+    "--azure-multimodal-deployment",
+    type=str,
+    default=None,
+    help="Vision-LLM deployment name for --table-mode=auto. "
+         "Falls back to AZURE_MULTIMODAL_DEPLOYMENT env var.",
+)
 def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
-            table_mode, table_pages, azure_api_key, azure_ocr_endpoint):
+            table_mode, table_pages, azure_api_key, azure_ocr_endpoint,
+            azure_multimodal_endpoint, azure_multimodal_deployment):
     """Convert a IndiaCode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:
@@ -201,9 +221,39 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
             or env_file_vars.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
             or os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
         )
+        resolved_multimodal_endpoint = (
+            azure_multimodal_endpoint
+            or env_file_vars.get("AZURE_MULTIMODAL_ENDPOINT")
+            or os.environ.get("AZURE_MULTIMODAL_ENDPOINT")
+        )
+        resolved_multimodal_deployment = (
+            azure_multimodal_deployment
+            or env_file_vars.get("AZURE_MULTIMODAL_DEPLOYMENT")
+            or os.environ.get("AZURE_MULTIMODAL_DEPLOYMENT")
+        )
+        resolved_multimodal_api_style = (
+            env_file_vars.get("AZURE_MULTIMODAL_API_STYLE")
+            or os.environ.get("AZURE_MULTIMODAL_API_STYLE")
+        )
+        if table_mode == "auto" and not (
+            resolved_multimodal_endpoint and resolved_multimodal_deployment
+        ):
+            raise click.ClickException(
+                "--table-mode=auto requires --azure-multimodal-endpoint and "
+                "--azure-multimodal-deployment (or AZURE_MULTIMODAL_ENDPOINT "
+                "and AZURE_MULTIMODAL_DEPLOYMENT in env)"
+            )
+        if table_mode == "auto" and not resolved_multimodal_api_style:
+            raise click.ClickException(
+                "--table-mode=auto requires AZURE_MULTIMODAL_API_STYLE in env. "
+                "Set it to one of: 'chat', 'responses', 'azure-inference'."
+            )
     else:
         resolved_api_key = None
         resolved_ocr_endpoint = None
+        resolved_multimodal_endpoint = None
+        resolved_multimodal_deployment = None
+        resolved_multimodal_api_style = None
         if table_pages:
             raise click.ClickException(
                 "--table-pages requires --table-mode=declared"
@@ -219,6 +269,9 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
         table_pages=parsed_table_pages,
         azure_api_key=resolved_api_key,
         azure_ocr_endpoint=resolved_ocr_endpoint,
+        azure_multimodal_endpoint=resolved_multimodal_endpoint,
+        azure_multimodal_deployment=resolved_multimodal_deployment,
+        azure_multimodal_api_style=resolved_multimodal_api_style,
     )
     click.echo(result)
 

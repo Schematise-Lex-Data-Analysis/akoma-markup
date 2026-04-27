@@ -60,12 +60,6 @@ def build_llm(config: dict):
         )
 
     if provider == "azure":
-        try:
-            from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
-        except ImportError:
-            raise ImportError(
-                "Install the azure extra: pip install akoma-markup[azure]"
-            )
         endpoint = config.pop("endpoint", None) or os.environ.get(
             "AZURE_INFERENCE_ENDPOINT"
         )
@@ -79,10 +73,49 @@ def build_llm(config: dict):
                 "Provide endpoint and credential in config or set "
                 "AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL env vars"
             )
-        return AzureAIChatCompletionsModel(
-            endpoint=endpoint,
-            credential=credential,
-            model=model or DEFAULT_AZURE_MODEL,
+
+        deployment = model or DEFAULT_AZURE_MODEL
+
+        # The deployment's API surface must be specified explicitly — different
+        # Azure deployments expose different transports (chat/completions,
+        # Responses API, or older Azure-Inference path) and we don't probe.
+        from .azure_api import validate_api_mode
+
+        api_style = (
+            config.pop("api_style", None)
+            or os.environ.get("AZURE_INFERENCE_API_STYLE")
+        )
+        api_mode = validate_api_mode(api_style, "AZURE_INFERENCE_API_STYLE")
+
+        if api_mode == "azure-inference":
+            try:
+                from langchain_azure_ai.chat_models import (
+                    AzureAIChatCompletionsModel,
+                )
+            except ImportError:
+                raise ImportError(
+                    "Install the azure extra: pip install akoma-markup[azure]"
+                )
+            return AzureAIChatCompletionsModel(
+                endpoint=endpoint,
+                credential=credential,
+                model=deployment,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        # OpenAI-compat path: chat/completions or Responses
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError:
+            raise ImportError(
+                "Install the azure extra: pip install akoma-markup[azure]"
+            )
+        return ChatOpenAI(
+            base_url=endpoint,
+            api_key=credential,
+            model=deployment,
+            use_responses_api=(api_mode == "responses"),
             temperature=temperature,
             max_tokens=max_tokens,
         )

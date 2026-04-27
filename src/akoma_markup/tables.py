@@ -5,12 +5,13 @@ This module re-extracts affected regions via Azure OCR (which emits tables as
 clean markdown) and splices the result back into the per-page text list. The
 downstream section-level LLM in converter.py then converts both prose AND
 markdown tables to Laws.Africa markup in a single pass, so this module does no
-LLM work itself — it is purely an extractor.
+LLM work itself for content — it only uses a vision LLM to *locate* table
+pages in the ``auto`` mode.
 
-Three strategies:
-    - "declared"  : user lists the table pages (cheapest, most reliable)
-    - "heuristic" : pdfplumber.find_tables() flags ruled-table pages, OCR those
-    - "full"      : OCR every page, use OCR markdown as the whole text source
+Two strategies:
+    - "declared" : user lists the table pages (cheapest, most reliable)
+    - "auto"     : a vision LLM looks at every page image and flags tables;
+                   only flagged pages get OCR'd
 """
 
 from __future__ import annotations
@@ -20,13 +21,26 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
+from .pdf_to_image import render_pages
 from .table_ocr_ai import AzureOCR
+from .vision_llm import VisionClient
 
-TableMode = Literal["declared", "heuristic", "full"]
+TableMode = Literal["declared", "auto", "full"]
+
+
+_TABLE_DETECTION_PROMPT = (
+    "Look at this single page from a legislative or regulatory document.\n"
+    "Does it contain a TABLE — content arranged in clear rows and columns "
+    "(ruled grids, schedule/form layouts, balance-sheet style two-column "
+    "ledgers, or numerical tables with column headers)?\n"
+    "Ignore: ordinary paragraphs, multi-column running prose, bulleted lists, "
+    "section headings.\n"
+    "Reply with a single token: YES or NO."
+)
 
 
 def parse_page_spec(spec: str) -> list[int]:
-    """Parse a page spec like "10,12-15,20" into a sorted unique list of 1-indexed page numbers.
+    """Parse a page spec like ``"10,12-15,20"`` into a sorted unique 1-indexed list.
 
     Args:
         spec: Comma-separated page numbers and ranges.
@@ -108,21 +122,54 @@ def _ocr_pages(pdf_path: Path, pages: list[int], ocr: AzureOCR) -> dict[int, str
     return per_page
 
 
-def _classify_table_pages(pdf_path: Path) -> list[int]:
-    """Return 1-indexed page numbers that contain at least one table.
-
-    Uses pdfplumber.find_tables() with the default (line-based) strategy —
-    reliable and false-positive-free on PDFs with ruled tables. PDFs that
-    rely on whitespace alignment (no visible rules) will flag few/no pages;
-    use `--table-mode declared` for those.
-    """
-    import pdfplumber
-
+def _detect_table_pages_vision(
+    pdf_path: Path,
+    total_pages: int,
+    vision: VisionClient,
+    dpi: int = 120,
+    max_workers: int = 8,
+) -> list[int]:
+    """Render every page and ask the vision LLM which contain tables."""
+    print(
+        f"[tables] auto: rendering {total_pages} pages at {dpi} DPI ...",
+        file=sys.stderr,
+    )
+    images = render_pages(pdf_path, range(1, total_pages + 1), dpi=dpi)
+    print(
+        f"[tables] auto: classifying {total_pages} pages with vision LLM "
+        f"endpoint={vision.endpoint!r} deployment={vision.deployment!r} "
+        f"(max_workers={max_workers}) ...",
+        file=sys.stderr,
+    )
+    answers = vision.classify_pages(
+        images, _TABLE_DETECTION_PROMPT, max_workers=max_workers
+    )
     flagged: list[int] = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for idx, page in enumerate(pdf.pages, start=1):
-            if page.find_tables():
-                flagged.append(idx)
+    error_count = 0
+    for p in sorted(answers):
+        reply = answers[p]
+        if reply.startswith("ERROR:"):
+            error_count += 1
+        is_table = reply.strip().upper().startswith("YES")
+        print(
+            f"[tables]   page {p}: {'TABLE' if is_table else 'no table'} "
+            f"(reply={reply[:60]!r})",
+            file=sys.stderr,
+        )
+        if is_table:
+            flagged.append(p)
+    if error_count == total_pages:
+        raise RuntimeError(
+            f"Vision LLM returned errors for ALL {total_pages} pages. "
+            f"First error: {answers[sorted(answers)[0]]}. "
+            f"Check AZURE_MULTIMODAL_ENDPOINT and AZURE_MULTIMODAL_DEPLOYMENT."
+        )
+    if error_count:
+        print(
+            f"[tables] auto: warning — {error_count}/{total_pages} pages "
+            f"errored during vision classification",
+            file=sys.stderr,
+        )
     return flagged
 
 
@@ -133,28 +180,35 @@ def rescue_tables(
     azure_api_key: str,
     table_pages: list[int] | None = None,
     azure_ocr_endpoint: str | None = None,
+    azure_multimodal_endpoint: str | None = None,
+    azure_multimodal_deployment: str | None = None,
+    azure_multimodal_api_style: str | None = None,
 ) -> tuple[list[str], dict[int, str]]:
     """Produce a per-page text list where table-containing pages are re-extracted via OCR.
 
-    Non-table pages stay as pdfplumber output; table pages are replaced with the
-    Azure OCR markdown (which preserves tables as `| … |` pipe blocks). The
-    downstream converter LLM turns those markdown tables into bluebell TABLE
-    blocks as part of its normal per-section conversion pass.
+    Non-table pages stay as pdfplumber output; table pages are replaced with
+    the Azure OCR markdown (which preserves tables as ``| … |`` pipe blocks).
+    The downstream converter LLM turns those markdown tables into bluebell
+    TABLE blocks as part of its normal per-section conversion pass.
 
     Args:
         pdf_path: Source PDF.
         per_page_text: pdfplumber output, one entry per page.
-        mode: "declared" | "heuristic" | "full".
-        azure_api_key: Azure API key for OCR.
+        mode: "declared" or "auto".
+        azure_api_key: Azure API key for OCR (and vision in ``auto`` mode).
         table_pages: 1-indexed page list; required when mode == "declared".
         azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
+        azure_multimodal_endpoint: Vision endpoint for ``auto`` mode. Falls
+            back to ``AZURE_MULTIMODAL_ENDPOINT`` env var.
+        azure_multimodal_deployment: Vision deployment for ``auto`` mode.
+            Falls back to ``AZURE_MULTIMODAL_DEPLOYMENT`` env var.
 
     Returns:
         Tuple of (per_page_text, rescued_pages). per_page_text has OCR markdown
-        spliced into rescued positions. rescued_pages maps 1-indexed page number
-        -> OCR markdown for each rescued page, so the caller can guarantee that
-        table content lands in the final output even if downstream section
-        extraction fails to absorb it.
+        spliced into rescued positions. rescued_pages maps 1-indexed page
+        number -> OCR markdown for each rescued page, so the caller can
+        guarantee that table content lands in the final output even if
+        downstream section extraction fails to absorb it.
     """
     ocr = AzureOCR(api_key=azure_api_key, endpoint=azure_ocr_endpoint)
 
@@ -162,20 +216,33 @@ def rescue_tables(
         if not table_pages:
             raise ValueError("mode='declared' requires table_pages=[...]")
         target_pages = table_pages
-    elif mode == "heuristic":
-        target_pages = _classify_table_pages(pdf_path)
+    elif mode == "auto":
+        vision = VisionClient(
+            api_key=azure_api_key,
+            endpoint=azure_multimodal_endpoint,
+            deployment=azure_multimodal_deployment,
+            api_mode=azure_multimodal_api_style,
+        )
+        target_pages = _detect_table_pages_vision(
+            pdf_path, len(per_page_text), vision
+        )
         if not target_pages:
             print(
-                "[tables] heuristic: no tables detected by pdfplumber, skipping OCR",
+                "[tables] auto: vision LLM flagged no table pages, skipping OCR",
                 file=sys.stderr,
             )
             return per_page_text, {}
         print(
-            f"[tables] heuristic: found tables on pages {target_pages}",
+            f"[tables] auto: vision LLM flagged pages {target_pages}",
             file=sys.stderr,
         )
     elif mode == "full":
         target_pages = list(range(1, len(per_page_text) + 1))
+        print(
+            f"[tables] full: OCR'ing all {len(target_pages)} pages "
+            f"(no vision pre-flight)",
+            file=sys.stderr,
+        )
     else:
         raise ValueError(f"Unknown table mode: {mode!r}")
 

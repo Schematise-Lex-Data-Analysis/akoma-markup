@@ -40,6 +40,9 @@ def convert(
     table_pages: list[int] | None = None,
     azure_api_key: str | None = None,
     azure_ocr_endpoint: str | None = None,
+    azure_multimodal_endpoint: str | None = None,
+    azure_multimodal_deployment: str | None = None,
+    azure_multimodal_api_style: str | None = None,
 ) -> str:
     """Convert a legislative PDF to Akoma Ntoso markup.
 
@@ -53,13 +56,18 @@ def convert(
             Defaults to PDF filename stem.
         act_number: Act number (e.g., "46 of 2023").
         replaces: Previous act this document replaces (e.g., "Criminal Procedure Code (CrPC) 1973").
-        table_mode: Optional table-rescue strategy. One of "declared", "heuristic", "full".
+        table_mode: Optional table-rescue strategy. One of "declared" or "auto".
             When None (default), only pdfplumber is used and tables in the PDF may be
             garbled in the output. When set, table regions are additionally sent to
             Azure OCR and converted to Laws.Africa TABLE blocks. Requires `azure_api_key`.
+            "auto" additionally requires `azure_multimodal_endpoint` and
+            `azure_multimodal_deployment` (or the matching env vars) for the
+            vision-LLM page classification step.
         table_pages: 1-indexed page list. Required when `table_mode="declared"`.
         azure_api_key: Azure API key. Required when `table_mode` is set.
         azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
+        azure_multimodal_endpoint: Vision-LLM endpoint (auto mode).
+        azure_multimodal_deployment: Vision-LLM deployment name (auto mode).
 
     Returns:
         Path to the generated markup file.
@@ -76,9 +84,10 @@ def convert(
         document_name = pdf.stem
 
     if table_mode is not None:
-        if table_mode not in {"declared", "heuristic", "full"}:
+        if table_mode not in {"declared", "auto", "full"}:
             raise ValueError(
-                f"table_mode must be 'declared', 'heuristic', or 'full'; got {table_mode!r}"
+                f"table_mode must be 'declared', 'auto', or 'full'; "
+                f"got {table_mode!r}"
             )
         if not azure_api_key:
             raise ValueError("table_mode requires azure_api_key")
@@ -105,9 +114,17 @@ def convert(
             azure_api_key=azure_api_key,
             table_pages=table_pages,
             azure_ocr_endpoint=azure_ocr_endpoint,
+            azure_multimodal_endpoint=azure_multimodal_endpoint,
+            azure_multimodal_deployment=azure_multimodal_deployment,
+            azure_multimodal_api_style=azure_multimodal_api_style,
         )
 
     raw_text = "\n".join(per_page_text)
+
+    raw_text_debug_path = Path(output_path).with_suffix(".raw_text_debug.txt")
+    raw_text_debug_path.write_text(raw_text)
+    print(f"Raw text (post-rescue) written to {raw_text_debug_path}", file=sys.stderr)
+
     all_lines = raw_text.splitlines()
 
     # 2. Parse TOC
@@ -145,49 +162,6 @@ def convert(
             unique.append(sec)
     sections = unique
     print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
-
-    # Guarantee rescued table content reaches the output. For every rescued
-    # page whose content didn't land in any extracted section, append a
-    # synthetic block. These flow through the normal LLM conversion so
-    # markdown tables still become bluebell TABLE blocks.
-    if rescued_pages:
-        all_section_content = "\n".join(s.get("content", "") for s in sections)
-        haystack = re.sub(r"\s+", " ", all_section_content).lower()
-        appended = 0
-        for page_num in sorted(rescued_pages):
-            md = rescued_pages[page_num]
-            stripped = md.strip()
-            if len(stripped) < 100:
-                continue  # nothing meaningful to preserve
-            mid = len(stripped) // 2
-            snippet_start = stripped.rfind(" ", max(0, mid - 40), mid) + 1
-            if snippet_start <= 0:
-                snippet_start = mid
-            snippet = stripped[snippet_start:snippet_start + 80]
-            snippet_norm = re.sub(r"\s+", " ", snippet).lower()
-            if snippet_norm and snippet_norm in haystack:
-                continue  # already absorbed by extract_section_content
-            sections.append(
-                {
-                    "num": f"page-{page_num}",
-                    "heading": f"Rescued content — page {page_num}",
-                    "content": md,
-                    "chapter_roman": "NA",
-                    "chapter_heading": "Rescued pages",
-                }
-            )
-            appended += 1
-            print(
-                f"Rescued page {page_num} not absorbed into any section; "
-                f"emitting as synthetic block ({len(md)} chars)",
-                file=sys.stderr,
-            )
-        if appended:
-            print(
-                f"{len(sections)} sections total after rescued-page placement "
-                f"(+{appended} synthetic)",
-                file=sys.stderr,
-            )
 
     # Perform OCR text writing before LLM conversion
     ocr_path = write_ocr_text(content_text, output_path)
