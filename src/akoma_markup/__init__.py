@@ -1,5 +1,6 @@
 """akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from .converter import build_chain, process_all_sections
 from .extractor import extract_pdf_pages, extract_pdf_text
 from .llm import build_llm
+from .markdown_table import render_region
 from .parser import (
     extract_chapter_ranges,
     extract_section_content,
@@ -14,6 +16,65 @@ from .parser import (
     parse_toc,
 )
 from .writer import write_markup, write_metadata, write_ocr_text
+
+
+# Recognises the rendered ``<<TABLE_REGION:N>>`` sentinel on its own line
+# (with arbitrary indentation). Used during splice to read the indent and
+# replace the line with a re-indented bluebell TABLE block.
+_SENTINEL_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)<<TABLE_REGION:(?P<id>\d+)>>[ \t]*$",
+    re.MULTILINE,
+)
+
+# Heuristic schedule-heading detection for trailing regions that no section
+# absorbed (typically FORM A / THE THIRD SCHEDULE / APPENDIX I at the end of
+# an act). Fall-back is "Schedule (page N)" when nothing matches.
+_SCHEDULE_HEADING_PATTERNS = [
+    re.compile(r"^(THE\s+[A-Z]+\s+SCHEDULE)\b"),
+    re.compile(r"^(SCHEDULE\s+[IVX0-9]+[A-Z]*)\b"),
+    re.compile(r"^(FORM\s+(?:No\.?\s*)?[A-Z0-9]+)\b"),
+    re.compile(r"^(APPENDIX\s+[IVX0-9]+[A-Z]*)\b"),
+    re.compile(r"^(ANNEX(?:URE)?\s+[IVX0-9]+[A-Z]*)\b"),
+]
+
+
+def _splice_sentinels(
+    markup: str, table_blocks: dict[int, str]
+) -> tuple[str, set[int]]:
+    """Replace each ``<<TABLE_REGION:N>>`` sentinel line with its TABLE block.
+
+    The replacement block is re-indented to match the sentinel's leading
+    whitespace, so a sentinel sitting under SUBSEC (4-space indent) yields a
+    TABLE block whose ``TABLE`` keyword is also at 4-space indent and whose
+    children nest from there. Returns the rewritten markup and the set of
+    region IDs that were consumed (so the caller can identify trailing
+    regions that need to be emitted as standalone schedules).
+    """
+    consumed: set[int] = set()
+
+    def _replace(m: re.Match) -> str:
+        indent = m.group("indent")
+        region_id = int(m.group("id"))
+        if region_id not in table_blocks:
+            return m.group(0)  # unknown id; leave token in place
+        consumed.add(region_id)
+        block = table_blocks[region_id]
+        return "\n".join(indent + ln if ln else "" for ln in block.split("\n"))
+
+    return _SENTINEL_LINE_RE.sub(_replace, markup), consumed
+
+
+def _detect_schedule_heading(markdown: str) -> str | None:
+    """Heuristically extract a schedule/form heading from the start of OCR output."""
+    for raw in markdown.splitlines()[:25]:
+        s = raw.strip().lstrip("“\"'").rstrip("”\"'").strip()
+        if not s:
+            continue
+        for pat in _SCHEDULE_HEADING_PATTERNS:
+            m = pat.match(s)
+            if m:
+                return m.group(1).strip()
+    return None
 
 # Azure AI services (optional)
 try:
@@ -100,14 +161,15 @@ def convert(
     print("Extracting text from PDF ...", file=sys.stderr)
     per_page_text = extract_pdf_pages(str(pdf))
 
-    rescued_pages: dict[int, str] = {}
+    table_regions: list[dict] = []
+    table_blocks: dict[int, str] = {}
     if table_mode is not None:
         from .tables import rescue_tables
         print(
             f"Rescuing tables via Azure OCR (mode={table_mode!r}) ...",
             file=sys.stderr,
         )
-        per_page_text, rescued_pages = rescue_tables(
+        per_page_text, table_regions = rescue_tables(
             pdf_path=pdf,
             per_page_text=per_page_text,
             mode=table_mode,
@@ -118,6 +180,37 @@ def convert(
             azure_multimodal_deployment=azure_multimodal_deployment,
             azure_multimodal_api_style=azure_multimodal_api_style,
         )
+        # Pre-render every region to a bluebell TABLE block (deterministic,
+        # no LLM). The result is held in memory and spliced into the section
+        # LLM's output at sentinel positions later.
+        table_blocks = {r["id"]: render_region(r["markdown"]) for r in table_regions}
+        print(
+            f"[tables] rescued {len(table_regions)} region(s); "
+            f"rendered {len(table_blocks)} bluebell TABLE blocks",
+            file=sys.stderr,
+        )
+        if table_regions:
+            regions_debug_path = Path(output_path or pdf.with_name(
+                f"{pdf.stem}_markup.txt"
+            )).with_suffix(".table_regions_debug.txt")
+            with open(regions_debug_path, "w") as f:
+                for r in table_regions:
+                    pages = r["pages"]
+                    span = (
+                        f"page {pages[0]}"
+                        if len(pages) == 1
+                        else f"pages {pages[0]}-{pages[-1]}"
+                    )
+                    f.write(f"{'=' * 80}\nREGION {r['id']}  ({span})\n{'=' * 80}\n\n")
+                    f.write("--- raw OCR markdown ---\n")
+                    f.write(r["markdown"])
+                    f.write("\n\n--- rendered bluebell ---\n")
+                    f.write(table_blocks.get(r["id"], "(none)"))
+                    f.write("\n\n")
+            print(
+                f"Table-region debug written to {regions_debug_path}",
+                file=sys.stderr,
+            )
 
     raw_text = "\n".join(per_page_text)
 
@@ -136,6 +229,18 @@ def convert(
         f"(TOC ends at line {toc_end_line})",
         file=sys.stderr,
     )
+    print("[parser] chapters detected:", file=sys.stderr)
+    for ch in _chapters:
+        print(f"  - {ch.get('roman', '?'):>6}  {ch.get('heading', '?')}",
+              file=sys.stderr)
+    print("[parser] chapter ranges:", file=sys.stderr)
+    for ch in chapter_ranges:
+        print(
+            f"  - CHAPTER {ch.get('roman', '?'):>6}  "
+            f"sections {ch.get('start', '?')}-{ch.get('end', '?')}  "
+            f"{ch.get('heading', '?')}",
+            file=sys.stderr,
+        )
 
     # 3. Extract section content (skip TOC)
     print(f"OCR text (raw): {all_lines[toc_end_line + 1:][:10]}", file=sys.stderr)
@@ -144,6 +249,54 @@ def convert(
 
     # 4. Map sections to chapters and deduplicate
     sections = filter_sections_by_chapters(sections, chapter_ranges)
+
+    # Superficial parser-output dump: TOC structure with each chapter
+    # showing the sections it covers. Useful for spotting wrong TOC parsing
+    # or misaligned chapter ranges before blaming the LLM.
+    def _section_num_int(num_str: str) -> int | None:
+        m = re.match(r"(\d+)", num_str or "")
+        return int(m.group(1)) if m else None
+
+    chapters_summary: list[dict] = []
+    assigned_section_nums: set[str] = set()
+    for ch in chapter_ranges:
+        ch_sections = []
+        for sec in section_names:
+            n = _section_num_int(sec["num"])
+            if (
+                n is not None
+                and ch.get("start") is not None
+                and ch.get("end") is not None
+                and ch["start"] <= n <= ch["end"]
+            ):
+                ch_sections.append(
+                    {"num": sec["num"], "heading": sec["heading"]}
+                )
+                assigned_section_nums.add(sec["num"])
+        chapters_summary.append({
+            "roman": ch.get("roman"),
+            "heading": ch.get("heading"),
+            "section_range": [ch.get("start"), ch.get("end")],
+            "section_count": len(ch_sections),
+            "sections": ch_sections,
+        })
+
+    uncategorized = [
+        {"num": s["num"], "heading": s["heading"]}
+        for s in section_names
+        if s["num"] not in assigned_section_nums
+    ]
+
+    parser_debug_path = Path(output_path).with_suffix(".parser_debug.json")
+    parser_debug_path.write_text(json.dumps({
+        "pdf_file": str(pdf),
+        "toc_end_line": toc_end_line,
+        "section_count_in_toc": len(section_names),
+        "chapter_count": len(chapter_ranges),
+        "chapters": chapters_summary,
+        "uncategorized_sections": uncategorized,
+    }, indent=2, ensure_ascii=False, default=str))
+    print(f"Parser debug written to {parser_debug_path}", file=sys.stderr)
 
     debug_tsv_path = Path(output_path).with_suffix(".sections_debug.tsv")
     with open(debug_tsv_path, 'a') as debug_file:
@@ -183,6 +336,54 @@ def convert(
         orig = sec_lookup.get(conv["num"], {})
         conv["chapter_roman"] = orig.get("chapter_roman", "NA")
         conv["chapter_heading"] = orig.get("chapter_heading", "Unknown")
+        conv["kind"] = "section"
+
+    # 5b. Splice rule-based bluebell TABLE blocks into the LLM output at
+    # every <<TABLE_REGION:N>> sentinel position. The LLM is told to copy
+    # sentinels verbatim; this step swaps them for the actual rendered
+    # tables so we don't pay the LLM's drop/truncation tax on table data.
+    consumed_region_ids: set[int] = set()
+    if table_blocks:
+        for conv in converted:
+            spliced, consumed = _splice_sentinels(conv["markup"], table_blocks)
+            conv["markup"] = spliced
+            consumed_region_ids |= consumed
+        print(
+            f"[tables] spliced {len(consumed_region_ids)}/{len(table_blocks)} "
+            f"region(s) into section markup",
+            file=sys.stderr,
+        )
+
+    # 5c. Emit any region the section-LLM output didn't consume (i.e. a
+    # sentinel that fell outside any TOC-listed section, e.g. trailing
+    # schedules at end of document) as standalone top-level SCHEDULE blocks.
+    trailing_regions = [
+        r for r in table_regions if r["id"] not in consumed_region_ids
+    ]
+    if trailing_regions:
+        print(
+            f"[tables] {len(trailing_regions)} region(s) had no enclosing "
+            f"section; emitting as top-level SCHEDULE block(s)",
+            file=sys.stderr,
+        )
+        for r in trailing_regions:
+            heading = _detect_schedule_heading(r["markdown"]) or (
+                f"Schedule (rescued from page {r['pages'][0]}"
+                + (f"-{r['pages'][-1]}" if len(r["pages"]) > 1 else "")
+                + ")"
+            )
+            block = table_blocks.get(r["id"], "")
+            indented_block = "\n".join(
+                "  " + ln if ln else "" for ln in block.split("\n")
+            )
+            converted.append({
+                "num": f"SCH_R{r['id']}",
+                "markup": f"SCHEDULE - {heading}\n{indented_block}",
+                "kind": "schedule",
+                "chapter_roman": "SCHEDULE",
+                "chapter_heading": heading,
+                "pages": r["pages"],
+            })
 
     # 6. Write output
     ocr_path = write_ocr_text(content_text, output_path)

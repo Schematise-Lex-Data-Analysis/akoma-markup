@@ -2,20 +2,30 @@
 
 pdfplumber flattens tables into garbled text because column structure is lost.
 This module re-extracts affected regions via Azure OCR (which emits tables as
-clean markdown) and splices the result back into the per-page text list. The
-downstream section-level LLM in converter.py then converts both prose AND
-markdown tables to Laws.Africa markup in a single pass, so this module does no
-LLM work itself for content — it only uses a vision LLM to *locate* table
-pages in the ``auto`` mode.
+clean markdown), groups consecutive rescued pages into "regions" (one logical
+table = one region, even when it spans pages), and splices a sentinel string
+``<<TABLE_REGION:N>>`` into ``per_page_text`` at the position of each region.
+The actual OCR markdown for each region is returned separately so callers
+can:
 
-Two strategies:
+  - keep table content OUT of the section-conversion LLM's input (the LLM
+    sees only the small sentinel placeholder, not 200 rows of balance-sheet
+    markdown that would blow its output budget), and
+  - render each region deterministically via ``markdown_table.render_region``
+    and splice the resulting bluebell ``TABLE`` block at the sentinel's
+    position after the section LLM call returns.
+
+Three detection strategies:
     - "declared" : user lists the table pages (cheapest, most reliable)
     - "auto"     : a vision LLM looks at every page image and flags tables;
                    only flagged pages get OCR'd
+    - "full"     : OCR every page (no detection)
 """
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +36,13 @@ from .table_ocr_ai import AzureOCR
 from .vision_llm import VisionClient
 
 TableMode = Literal["declared", "auto", "full"]
+
+# Sentinel format spliced into per_page_text. The section parser sees it
+# as inert text; the section-conversion LLM is instructed to copy it
+# verbatim; post-processing splices the rendered bluebell TABLE block in
+# its place. The format must stay in sync with SENTINEL_RE below.
+SENTINEL_FORMAT = "<<TABLE_REGION:{region_id}>>"
+SENTINEL_RE = re.compile(r"<<TABLE_REGION:(\d+)>>")
 
 
 _TABLE_DETECTION_PROMPT = (
@@ -89,25 +106,99 @@ def _slice_pdf(pdf_path: Path, pages: list[int]) -> Path:
     return Path(tmp.name)
 
 
+def _cache_path(pdf_path: Path) -> Path:
+    """Return the path of the per-page OCR cache file for ``pdf_path``."""
+    cache_dir = pdf_path.parent / ".akoma_checkpoints"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{pdf_path.stem}_table_ocr_cache.json"
+
+
+def _load_ocr_cache(pdf_path: Path) -> dict[int, str]:
+    """Load the per-page OCR cache, validated against the PDF's mtime.
+
+    Returns ``{page_number: markdown}`` for pages already OCR'd in a prior
+    run. Returns ``{}`` if the cache is missing, unreadable, or stale (the
+    PDF has been modified since the cache was written).
+    """
+    cache_path = _cache_path(pdf_path)
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+    if data.get("pdf_mtime") != pdf_path.stat().st_mtime:
+        print(
+            f"[tables]   cache invalidated: PDF mtime changed",
+            file=sys.stderr,
+        )
+        return {}
+    return {int(k): v for k, v in data.get("pages", {}).items()}
+
+
+def _save_ocr_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
+    """Atomically persist the per-page OCR cache to disk.
+
+    Called after every successful page so a Ctrl+C during a long rescue run
+    doesn't lose pages that already came back from Azure.
+    """
+    cache_path = _cache_path(pdf_path)
+    payload = {
+        "pdf_mtime": pdf_path.stat().st_mtime,
+        "pdf_name": pdf_path.name,
+        "pages": {str(k): v for k, v in sorted(page_md.items())},
+    }
+    tmp = cache_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    tmp.replace(cache_path)
+
+
 def _ocr_pages(pdf_path: Path, pages: list[int], ocr: AzureOCR) -> dict[int, str]:
     """OCR the given pages of a PDF and return {page_number: markdown}.
 
-    One request per page so we get a clean page_number -> markdown mapping back
-    and so we don't push a multi-megabyte merged PDF at the OCR endpoint (which
-    some Mistral document-ai deployments reject with 400).
+    One request per page so we get a clean page_number -> markdown mapping
+    back and so we don't push a multi-megabyte merged PDF at the OCR
+    endpoint (some Mistral document-ai deployments reject those with 400).
+
+    Pages that were OCR'd in a prior run are loaded from
+    ``.akoma_checkpoints/<stem>_table_ocr_cache.json`` and not re-fetched.
+    The cache is saved incrementally after each successful page, so an
+    interrupted run preserves all pages that completed before the
+    interruption.
     """
-    per_page: dict[int, str] = {}
-    for i, p in enumerate(pages, start=1):
+    cache = _load_ocr_cache(pdf_path)
+    cached_pages = [p for p in pages if p in cache]
+    missing_pages = [p for p in pages if p not in cache]
+
+    per_page: dict[int, str] = {p: cache[p] for p in cached_pages}
+    if cached_pages:
+        print(
+            f"[tables]   OCR cache hit for {len(cached_pages)} page(s): "
+            f"{cached_pages}",
+            file=sys.stderr,
+        )
+    if not missing_pages:
+        return per_page
+    print(
+        f"[tables]   OCR cache miss for {len(missing_pages)} page(s): "
+        f"{missing_pages}",
+        file=sys.stderr,
+    )
+
+    for i, p in enumerate(missing_pages, start=1):
         single = _slice_pdf(pdf_path, [p])
         try:
             print(
-                f"[tables]   OCR page {p} ({i}/{len(pages)}) ...",
+                f"[tables]   OCR page {p} ({i}/{len(missing_pages)}) ...",
                 file=sys.stderr,
             )
-            per_page[p] = ocr.extract_text(single)
+            md = ocr.extract_text(single)
+            per_page[p] = md
+            cache[p] = md
+            _save_ocr_cache(pdf_path, cache)  # checkpoint after each page
             print(
                 f"[tables] --- OCR markdown for page {p} ---\n"
-                f"{per_page[p]}\n"
+                f"{md}\n"
                 f"[tables] --- end page {p} ---",
                 file=sys.stderr,
             )
@@ -173,6 +264,25 @@ def _detect_table_pages_vision(
     return flagged
 
 
+def _group_consecutive_pages(pages: list[int]) -> list[list[int]]:
+    """Collapse a sorted page list into consecutive runs.
+
+    ``[3, 78, 79, 80, 92]`` -> ``[[3], [78, 79, 80], [92]]``. A multi-page
+    table normally occupies consecutive pages, so consecutive rescued pages
+    = one logical region.
+    """
+    if not pages:
+        return []
+    pages = sorted(set(pages))
+    groups: list[list[int]] = [[pages[0]]]
+    for p in pages[1:]:
+        if p == groups[-1][-1] + 1:
+            groups[-1].append(p)
+        else:
+            groups.append([p])
+    return groups
+
+
 def rescue_tables(
     pdf_path: Path,
     per_page_text: list[str],
@@ -183,32 +293,33 @@ def rescue_tables(
     azure_multimodal_endpoint: str | None = None,
     azure_multimodal_deployment: str | None = None,
     azure_multimodal_api_style: str | None = None,
-) -> tuple[list[str], dict[int, str]]:
-    """Produce a per-page text list where table-containing pages are re-extracted via OCR.
+) -> tuple[list[str], list[dict]]:
+    """Detect, OCR, and isolate tabular regions from a PDF's per-page text.
 
-    Non-table pages stay as pdfplumber output; table pages are replaced with
-    the Azure OCR markdown (which preserves tables as ``| … |`` pipe blocks).
-    The downstream converter LLM turns those markdown tables into bluebell
-    TABLE blocks as part of its normal per-section conversion pass.
+    Returns ``per_page_text`` with each rescued region replaced by a
+    ``<<TABLE_REGION:N>>`` sentinel (so the section parser doesn't drag
+    table markdown into a section's content blob and blow the LLM's output
+    budget), plus a list of region dicts containing the actual OCR markdown.
 
     Args:
         pdf_path: Source PDF.
         per_page_text: pdfplumber output, one entry per page.
-        mode: "declared" or "auto".
+        mode: "declared", "auto", or "full".
         azure_api_key: Azure API key for OCR (and vision in ``auto`` mode).
         table_pages: 1-indexed page list; required when mode == "declared".
         azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
-        azure_multimodal_endpoint: Vision endpoint for ``auto`` mode. Falls
-            back to ``AZURE_MULTIMODAL_ENDPOINT`` env var.
+        azure_multimodal_endpoint: Vision endpoint for ``auto`` mode.
         azure_multimodal_deployment: Vision deployment for ``auto`` mode.
-            Falls back to ``AZURE_MULTIMODAL_DEPLOYMENT`` env var.
+        azure_multimodal_api_style: Vision API style for ``auto`` mode
+            ('chat' | 'responses' | 'azure-inference').
 
     Returns:
-        Tuple of (per_page_text, rescued_pages). per_page_text has OCR markdown
-        spliced into rescued positions. rescued_pages maps 1-indexed page
-        number -> OCR markdown for each rescued page, so the caller can
-        guarantee that table content lands in the final output even if
-        downstream section extraction fails to absorb it.
+        Tuple ``(per_page_text, table_regions)`` where:
+          - ``per_page_text`` has the first page of each region replaced by
+            the sentinel string and the rest of the region's pages blanked,
+          - ``table_regions`` is a list of dicts ``{id, pages, markdown}``,
+            one per region, in document order. Each region's ``markdown`` is
+            the concatenated OCR output for its constituent pages.
     """
     ocr = AzureOCR(api_key=azure_api_key, endpoint=azure_ocr_endpoint)
 
@@ -231,7 +342,7 @@ def rescue_tables(
                 "[tables] auto: vision LLM flagged no table pages, skipping OCR",
                 file=sys.stderr,
             )
-            return per_page_text, {}
+            return per_page_text, []
         print(
             f"[tables] auto: vision LLM flagged pages {target_pages}",
             file=sys.stderr,
@@ -252,8 +363,30 @@ def rescue_tables(
     )
     ocr_markdown = _ocr_pages(pdf_path, target_pages, ocr)
 
-    result = list(per_page_text)
-    for page_num, md in ocr_markdown.items():
-        result[page_num - 1] = md
+    page_groups = _group_consecutive_pages(target_pages)
+    print(
+        f"[tables] grouped {len(target_pages)} page(s) into "
+        f"{len(page_groups)} region(s): {page_groups}",
+        file=sys.stderr,
+    )
 
-    return result, ocr_markdown
+    result = list(per_page_text)
+    table_regions: list[dict] = []
+    for region_id, pages in enumerate(page_groups):
+        region_md = "\n\n".join(
+            ocr_markdown[p] for p in pages if p in ocr_markdown
+        ).strip()
+        if not region_md:
+            continue
+        sentinel = SENTINEL_FORMAT.format(region_id=region_id)
+        # Sentinel goes on the first page of the region (so it occupies that
+        # page's slot in the document order). Other pages in the region are
+        # blanked so they don't contribute pdfplumber junk to raw_text.
+        result[pages[0] - 1] = f"\n{sentinel}\n"
+        for p in pages[1:]:
+            result[p - 1] = ""
+        table_regions.append(
+            {"id": region_id, "pages": pages, "markdown": region_md}
+        )
+
+    return result, table_regions
