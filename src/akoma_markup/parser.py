@@ -59,6 +59,33 @@ def _heading_similarity(heading1: str, heading2: str) -> float:
     return difflib.SequenceMatcher(None, h1, h2).ratio()
 
 
+# Phrases that announce the start of the actual TOC in Indian / Africa-style
+# legislative PDFs. Anything before the first match (enactment metadata,
+# lists of amending acts, abbreviation lists, etc.) is NOT the TOC and must
+# be skipped — otherwise parse_toc happily picks up the amending-acts list
+# as if those were section headings.
+_TOC_START_PATTERNS = [
+    re.compile(r"^ARRANGEMENT\s+OF\s+SECTIONS\s*$", re.IGNORECASE),
+    re.compile(r"^ARRANGEMENT\s+OF\s+CLAUSES\s*$", re.IGNORECASE),
+    re.compile(r"^TABLE\s+OF\s+CONTENTS\s*$", re.IGNORECASE),
+    re.compile(r"^CONTENTS\s*$", re.IGNORECASE),
+]
+
+
+def _find_toc_start(lines: list[str]) -> int:
+    """Return the line index immediately after the TOC start marker.
+
+    Returns 0 if no marker is found, in which case ``parse_toc`` scans from
+    the top (legacy behaviour).
+    """
+    for i, line in enumerate(lines):
+        s = line.strip()
+        for pat in _TOC_START_PATTERNS:
+            if pat.match(s):
+                return i + 1
+    return 0
+
+
 def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
     """Parse the Table of Contents to extract chapter names and section names.
 
@@ -85,21 +112,34 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
     sections = []
     toc_end_line = 0
     seen_headings: set[str] = set()
-    
-    # Extract enactment title from first non-empty line
+
+    # Anchor scan to the TOC start marker ("ARRANGEMENT OF SECTIONS" or
+    # equivalent). Anything before that line is enactment metadata / lists
+    # of amending acts / abbreviations — never the TOC. If no marker is
+    # found we fall back to scanning from line 0 (legacy behaviour, may
+    # mis-pick up pre-TOC content as section headings).
+    toc_start = _find_toc_start(lines)
+
+    # Extract enactment title from first non-divider line of the document.
+    # Skipping divider lines (e.g. "____________") avoids the case where the
+    # first line right after the TOC anchor is a separator that would then
+    # immediately trigger the "title repeated" stop condition.
     enactment_title = None
     for line in lines:
-        if line.strip():
-            enactment_title = line.strip()
-            break
+        s = line.strip()
+        if not s:
+            continue
+        if re.fullmatch(r"[_\-=*~]{3,}", s):
+            continue
+        enactment_title = s
+        break
 
-    i = 0
+    i = toc_start
     while i < len(lines):
         line = lines[i].strip()
 
         # Stop if we encounter the enactment title again (start of actual act)
         if enactment_title and line.lower() == enactment_title.lower() and i > 10:
-            # Make sure we're not at the very beginning
             break
 
         # Detect any CHAPTER or PART line (roman, arabic, letter — any style).
@@ -109,7 +149,10 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
             if next_heading in seen_headings:
                 break
 
-        chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
+        # Match CHAPTER or PART followed by a roman numeral. Indian acts use
+        # both interchangeably (Banking Regulation Act uses PART, most other
+        # IndiaCode acts use CHAPTER) — same structural concept either way.
+        chapter_match = re.match(r"^(?:CHAPTER|PART)\s+([IVXLCA]+)$", line)
         if chapter_match:
             roman = chapter_match.group(1)
             if i + 1 < len(lines):
@@ -214,7 +257,7 @@ def extract_chapter_ranges(
     while i < end:
         line = toc_lines[i].strip()
 
-        chapter_match = re.match(r"^CHAPTER\s+([IVXLCA]+)$", line)
+        chapter_match = re.match(r"^(?:CHAPTER|PART)\s+([IVXLCA]+)$", line)
         if chapter_match:
             if current_chapter and chapter_sections:
                 current_chapter["start"] = min(chapter_sections)

@@ -21,21 +21,23 @@ def write_ocr_text(text: str, output_path: str) -> str:
 
 
 def write_markup(sections: list[dict], output_path: str) -> str:
-    """Write converted sections to a markup text file grouped by chapter.
+    """Write converted entries to a markup text file.
 
-    Args:
-        sections: List of section dicts with 'markup', 'chapter_roman', 'chapter_heading'.
-        output_path: Destination file path.
-
-    Returns:
-        The resolved output path.
+    Section entries (``kind`` is ``"section"`` or absent) are grouped by
+    chapter under ``CHAPTER`` dividers. Schedule entries (``kind ==
+    "schedule"``) are emitted at the end under a single ``SCHEDULES``
+    divider with no chapter wrapper — they're top-level structural
+    elements, peers of chapters, not children of one.
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    section_entries = [s for s in sections if s.get("kind") != "schedule"]
+    schedule_entries = [s for s in sections if s.get("kind") == "schedule"]
+
     with open(out, "w", encoding="utf-8") as f:
         current_chapter = None
-        for sec in sections:
+        for sec in section_entries:
             chapter_id = sec.get("chapter_roman", "NA")
             if chapter_id != current_chapter:
                 current_chapter = chapter_id
@@ -44,6 +46,22 @@ def write_markup(sections: list[dict], output_path: str) -> str:
                 f.write("=" * 80 + "\n\n")
             f.write(sec["markup"])
             f.write("\n\n")
+
+        if schedule_entries:
+            f.write("\n\n" + "=" * 80 + "\n")
+            f.write("SCHEDULES\n")
+            f.write("=" * 80 + "\n\n")
+            for sch in schedule_entries:
+                pages = sch.get("pages") or []
+                if pages:
+                    span = (
+                        f"page {pages[0]}"
+                        if len(pages) == 1
+                        else f"pages {pages[0]}-{pages[-1]}"
+                    )
+                    f.write(f"# Source: {span}\n")
+                f.write(sch["markup"])
+                f.write("\n\n")
 
     return str(out)
 

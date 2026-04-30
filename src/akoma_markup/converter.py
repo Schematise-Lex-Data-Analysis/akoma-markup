@@ -22,6 +22,21 @@ MARKUP RULES:
 7. Illustrations: Start with "Illustration" or "(a)", "(b)" as separate indented paragraphs
 8. Exceptions: Start with "Exception" as a separate indented paragraph
 9. Provisos: Start with "Provided that" as a separate indented paragraph
+10. Table placeholders: tokens of the form ``<<TABLE_REGION:N>>`` (where N is
+    one or more digits) are STRUCTURAL PLACEHOLDERS for tables that will be
+    spliced in by deterministic post-processing.
+
+    Rules for these tokens:
+    - COPY each placeholder verbatim into the output, on its own line, at
+      the same indentation depth as it appears in the input. The indentation
+      determines where the table will end up nested in the bluebell tree
+      (under SEC, SUBSEC, PARA, etc.) — do NOT change it.
+    - Do NOT paraphrase, expand, remove, describe, comment on, or attempt to
+      convert these tokens. They are not English text, and they are not
+      tables you should render — leave them exactly as ``<<TABLE_REGION:N>>``.
+    - If a placeholder token is the only content of a paragraph, output
+      just that line at the right indent — do not wrap it in PARA, TABLE,
+      SUBSEC, or any other keyword.
 
 EXAMPLE OUTPUT:
 ```
@@ -39,6 +54,30 @@ SEC 41. - When police may arrest without warrant
     Any officer in charge of a police station may...
 
   Explanation.—For the purposes of this section...
+```
+
+EXAMPLE WITH A TABLE PLACEHOLDER (the token is preserved verbatim at the
+right indentation; post-processing will splice in the actual TABLE block):
+
+Input section content:
+```
+(1) The prescribed fees are as follows:
+
+<<TABLE_REGION:0>>
+
+(2) Fees may be revised from time to time.
+```
+
+Correct output (placeholder copied verbatim under SUBSEC (1) at the right indent):
+```
+SEC 10. - Fee schedule
+  SUBSEC (1)
+    The prescribed fees are as follows:
+
+    <<TABLE_REGION:0>>
+
+  SUBSEC (2)
+    Fees may be revised from time to time.
 ```
 
 PRESERVE the exact legal text. Do not paraphrase or summarize."""
@@ -66,8 +105,22 @@ RETRYABLE_KEYWORDS = [
     "rate limit",
     "ReadTimeout",
     "read timed out",
+    "timeout",
+    "timed out",
     "ConnectionError",
-    "Connection reset",
+    "connection error",   # openai SDK formats network blips this way
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+    "remote disconnected",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "500",
+    "502",
+    "503",
+    "504",
+    "internal server error",
 ]
 
 

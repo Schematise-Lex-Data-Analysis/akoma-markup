@@ -109,6 +109,89 @@ When using `--llm-env`, the CLI reads `PROVIDER`, `AZURE_INFERENCE_ENDPOINT`,
 `AZURE_INFERENCE_CREDENTIAL`, `AZURE_MODEL_ID`, `ANTHROPIC_API_KEY`, and
 `ANTHROPIC_MODEL_ID` from the file.
 
+## Table rescue (optional)
+
+PDFs that contain tables come out garbled from `pdfplumber` because column
+structure is lost when the page is flattened to text. To fix this, `convert`
+can optionally re-extract table-bearing pages through Azure Document
+Intelligence OCR (which preserves tables as markdown pipe blocks) and splice
+the result back into the per-page text stream. The downstream LLM converts
+those markdown tables into bluebell `TABLE` blocks during normal section
+conversion.
+
+This requires an Azure API key with access to a Document Intelligence
+deployment. The endpoint can be passed explicitly or read from the
+`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` environment variable; the API key
+falls back to `AZURE_API_KEY`.
+
+Three modes:
+
+- `declared` — you list the table pages yourself. Cheapest and most
+  reliable. Use this when you already know which pages have tables.
+- `heuristic` — `pdfplumber.find_tables()` flags pages that contain a
+  ruled table. Works well for PDFs with visible cell borders; misses
+  whitespace-aligned tables.
+- `full` — every page is sent to Azure OCR. Slowest and most expensive,
+  but guaranteed to catch every table.
+
+### As a library
+
+```python
+from akoma_markup import convert
+
+# Declared mode: you know which pages contain tables
+result = convert(
+    pdf_path="banking_act.pdf",
+    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    table_mode="declared",
+    table_pages=[12, 18, 19, 25],
+    azure_api_key="<azure-key>",  # or set AZURE_API_KEY
+    azure_ocr_endpoint="https://<resource>.services.ai.azure.com/...",  # optional
+)
+
+# Heuristic mode: let pdfplumber flag table pages
+result = convert(
+    pdf_path="banking_act.pdf",
+    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    table_mode="heuristic",
+    azure_api_key="<azure-key>",
+)
+
+# Full mode: OCR every page
+result = convert(
+    pdf_path="banking_act.pdf",
+    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
+    table_mode="full",
+    azure_api_key="<azure-key>",
+)
+```
+
+### As a CLI
+
+```bash
+# Declared mode (--table-pages accepts comma + range syntax)
+akoma-markup banking_act.pdf \
+  --llm-env .env \
+  --table-mode declared \
+  --table-pages "12,18-19,25" \
+  --azure-api-key "<azure-key>"
+
+# Heuristic mode
+akoma-markup banking_act.pdf \
+  --llm-env .env \
+  --table-mode heuristic
+
+# Full mode (OCR every page)
+akoma-markup banking_act.pdf \
+  --llm-env .env \
+  --table-mode full \
+  --azure-ocr-endpoint "https://<resource>.services.ai.azure.com/..."
+```
+
+`--azure-api-key` and `--azure-ocr-endpoint` fall back to `AZURE_API_KEY`
+and `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` (read from `--llm-env` if
+provided, or from the process environment).
+
 ## Output
 
 Running `convert` produces:
