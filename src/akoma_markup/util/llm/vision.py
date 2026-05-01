@@ -2,7 +2,7 @@
 
 The deployment's API surface (chat/completions, Responses, or Azure AI
 Inference) must be supplied explicitly — either via the ``api_mode`` constructor
-argument or the ``AZURE_MULTIMODAL_API_STYLE`` env var. Used by ``tables.py``'s
+argument or the ``AZURE_VISION_API_STYLE`` env var. Used by ``tables.py``'s
 ``auto`` mode to spot table pages before paying for OCR.
 """
 
@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
 from .azure_api import ApiMode, validate_api_mode
-from .pdf_to_image import image_to_data_url
+from ..pdf.images import image_to_data_url
 
 
 # Azure's Responses API enforces max_output_tokens >= 16.
@@ -33,19 +33,19 @@ class VisionClient:
         max_tokens: int = _MIN_OUTPUT_TOKENS,
         temperature: float = 0.0,
     ):
-        self.api_key = api_key or os.environ.get("AZURE_API_KEY")
-        self.endpoint = endpoint or os.environ.get("AZURE_MULTIMODAL_ENDPOINT")
-        self.deployment = deployment or os.environ.get("AZURE_MULTIMODAL_DEPLOYMENT")
+        self.api_key = api_key or os.environ.get("AZURE_VISION_KEY")
+        self.endpoint = endpoint or os.environ.get("AZURE_VISION_ENDPOINT")
+        self.deployment = deployment or os.environ.get("AZURE_VISION_MODEL")
         if not (self.api_key and self.endpoint and self.deployment):
             raise ValueError(
                 "VisionClient requires api_key, endpoint, and deployment "
-                "(or AZURE_API_KEY / AZURE_MULTIMODAL_ENDPOINT / "
-                "AZURE_MULTIMODAL_DEPLOYMENT env vars)."
+                "(or AZURE_VISION_KEY / AZURE_VISION_ENDPOINT / "
+                "AZURE_VISION_MODEL env vars)."
             )
 
-        resolved_mode = api_mode or os.environ.get("AZURE_MULTIMODAL_API_STYLE")
+        resolved_mode = api_mode or os.environ.get("AZURE_VISION_API_STYLE")
         self.api_mode: ApiMode = validate_api_mode(
-            resolved_mode, "AZURE_MULTIMODAL_API_STYLE"
+            resolved_mode, "AZURE_VISION_API_STYLE"
         )
 
         self.max_tokens = max(max_tokens, _MIN_OUTPUT_TOKENS)

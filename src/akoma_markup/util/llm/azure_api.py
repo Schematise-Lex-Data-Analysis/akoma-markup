@@ -8,9 +8,10 @@ The three transports we support:
     - ``azure-inference`` Older Azure AI Inference path via azure-ai-inference
                           SDK (api-key header + ?api-version=... query param).
 
-Both ``vision_llm.py`` (per-page table classification) and ``llm.py`` (main
-section-conversion LLM) read their ``AZURE_*_API_STYLE`` env var through
-``validate_api_mode`` so a single ``.env`` swap changes both consistently.
+Both ``util/llm/vision.py`` (per-page table classification) and
+``util/llm/factory.py`` (main section-conversion LLM) read their
+``AZURE_*_API_STYLE`` env var through ``validate_api_mode`` so a single
+``.env`` swap changes both consistently.
 """
 
 from __future__ import annotations

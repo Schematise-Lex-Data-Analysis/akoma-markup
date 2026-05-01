@@ -11,7 +11,7 @@ can:
   - keep table content OUT of the section-conversion LLM's input (the LLM
     sees only the small sentinel placeholder, not 200 rows of balance-sheet
     markdown that would blow its output budget), and
-  - render each region deterministically via ``markdown_table.render_region``
+  - render each region deterministically via ``.render.render_region``
     and splice the resulting bluebell ``TABLE`` block at the sentinel's
     position after the section LLM call returns.
 
@@ -31,9 +31,9 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from .pdf_to_image import render_pages
-from .table_ocr_ai import AzureOCR
-from .vision_llm import VisionClient
+from ...util.pdf.images import render_pages
+from .azure_ocr import AzureOCR
+from ...util.llm.vision import VisionClient
 
 TableMode = Literal["declared", "auto", "full"]
 
@@ -118,7 +118,9 @@ def _load_ocr_cache(pdf_path: Path) -> dict[int, str]:
 
     Returns ``{page_number: markdown}`` for pages already OCR'd in a prior
     run. Returns ``{}`` if the cache is missing, unreadable, or stale (the
-    PDF has been modified since the cache was written).
+    PDF has been modified since the cache was written). Caches written
+    under a different value shape (e.g. parsed JSON tables from an earlier
+    code revision) are also discarded.
     """
     cache_path = _cache_path(pdf_path)
     if not cache_path.exists():
@@ -129,11 +131,16 @@ def _load_ocr_cache(pdf_path: Path) -> dict[int, str]:
         return {}
     if data.get("pdf_mtime") != pdf_path.stat().st_mtime:
         print(
-            f"[tables]   cache invalidated: PDF mtime changed",
+            "[tables]   cache invalidated: PDF mtime changed",
             file=sys.stderr,
         )
         return {}
-    return {int(k): v for k, v in data.get("pages", {}).items()}
+    pages = data.get("pages", {})
+    if pages and not isinstance(next(iter(pages.values())), str):
+        # Cache from an earlier code revision had list-of-dicts values;
+        # re-fetch rather than crash on the type mismatch.
+        return {}
+    return {int(k): v for k, v in pages.items()}
 
 
 def _save_ocr_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
@@ -253,7 +260,7 @@ def _detect_table_pages_vision(
         raise RuntimeError(
             f"Vision LLM returned errors for ALL {total_pages} pages. "
             f"First error: {answers[sorted(answers)[0]]}. "
-            f"Check AZURE_MULTIMODAL_ENDPOINT and AZURE_MULTIMODAL_DEPLOYMENT."
+            f"Check AZURE_VISION_ENDPOINT and AZURE_VISION_MODEL."
         )
     if error_count:
         print(
@@ -287,12 +294,14 @@ def rescue_tables(
     pdf_path: Path,
     per_page_text: list[str],
     mode: TableMode,
-    azure_api_key: str,
+    azure_ocr_key: str,
+    azure_ocr_endpoint: str,
+    azure_ocr_model: str,
     table_pages: list[int] | None = None,
-    azure_ocr_endpoint: str | None = None,
-    azure_multimodal_endpoint: str | None = None,
-    azure_multimodal_deployment: str | None = None,
-    azure_multimodal_api_style: str | None = None,
+    azure_vision_key: str | None = None,
+    azure_vision_endpoint: str | None = None,
+    azure_vision_model: str | None = None,
+    azure_vision_api_style: str | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Detect, OCR, and isolate tabular regions from a PDF's per-page text.
 
@@ -305,12 +314,14 @@ def rescue_tables(
         pdf_path: Source PDF.
         per_page_text: pdfplumber output, one entry per page.
         mode: "declared", "auto", or "full".
-        azure_api_key: Azure API key for OCR (and vision in ``auto`` mode).
+        azure_ocr_key: Azure OCR (Mistral) API key.
+        azure_ocr_endpoint: Azure OCR endpoint.
+        azure_ocr_model: Azure OCR model name.
         table_pages: 1-indexed page list; required when mode == "declared".
-        azure_ocr_endpoint: Override the Azure Document Intelligence endpoint.
-        azure_multimodal_endpoint: Vision endpoint for ``auto`` mode.
-        azure_multimodal_deployment: Vision deployment for ``auto`` mode.
-        azure_multimodal_api_style: Vision API style for ``auto`` mode
+        azure_vision_key: Vision-LLM key for ``auto`` mode.
+        azure_vision_endpoint: Vision endpoint for ``auto`` mode.
+        azure_vision_model: Vision model/deployment for ``auto`` mode.
+        azure_vision_api_style: Vision API style for ``auto`` mode
             ('chat' | 'responses' | 'azure-inference').
 
     Returns:
@@ -321,7 +332,27 @@ def rescue_tables(
             one per region, in document order. Each region's ``markdown`` is
             the concatenated OCR output for its constituent pages.
     """
-    ocr = AzureOCR(api_key=azure_api_key, endpoint=azure_ocr_endpoint)
+    ocr = AzureOCR(
+        api_key=azure_ocr_key,
+        endpoint=azure_ocr_endpoint,
+        model=azure_ocr_model,
+    )
+    _key = azure_ocr_key or ""
+    _redacted = (
+        f"{_key[:8]}…{_key[-4:]}" if len(_key) > 12 else "<missing>"
+    )
+    print(
+        f"[tables] OCR endpoint={ocr.endpoint!r} model={ocr.model!r} "
+        f"api_key={_redacted}",
+        file=sys.stderr,
+    )
+    print(
+        f"[tables] vision endpoint={azure_vision_endpoint!r} "
+        f"model={azure_vision_model!r} "
+        f"api_style={azure_vision_api_style!r} "
+        f"(used only in --table-mode=auto)",
+        file=sys.stderr,
+    )
 
     if mode == "declared":
         if not table_pages:
@@ -329,10 +360,10 @@ def rescue_tables(
         target_pages = table_pages
     elif mode == "auto":
         vision = VisionClient(
-            api_key=azure_api_key,
-            endpoint=azure_multimodal_endpoint,
-            deployment=azure_multimodal_deployment,
-            api_mode=azure_multimodal_api_style,
+            api_key=azure_vision_key,
+            endpoint=azure_vision_endpoint,
+            deployment=azure_vision_model,
+            api_mode=azure_vision_api_style,
         )
         target_pages = _detect_table_pages_vision(
             pdf_path, len(per_page_text), vision

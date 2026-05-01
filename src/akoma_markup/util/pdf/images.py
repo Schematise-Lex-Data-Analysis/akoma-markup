@@ -1,8 +1,7 @@
 """Render PDF pages to PIL images using pypdfium2.
 
 Pure-Python wheels of Google's PDFium engine — same renderer Chrome ships, no
-system binaries (poppler, ImageMagick) required. Replaces the pdf2image-based
-path used by the multimodal POC in ``multimodal_analyzer.py``.
+system binaries (poppler, ImageMagick) required.
 """
 
 from __future__ import annotations
