@@ -1,24 +1,19 @@
 # akoma-markup
 
-akom-markup is an open course tool (pypi package and cli) for converting law pdfs (source - https://www.indiacode.nic.in/) into markup files following the [Akoma Ntoso](https://www.oasis-open.org/standard/akn-v1-0/) / [Laws.Africa](https://laws.africa/) markup format.
+`akoma-markup` is a tool for converting law
+PDFs into markup files following the
+[Akoma Ntoso](https://www.oasis-open.org/standard/akn-v1-0/) format.
 
+## Workflow
+The following diagram explains the workflow from a high-level
 
-# Roadmap
 ![roadmap](image.png)
-
-# Setting up for development
-
 
 ## Installation
 
-Install the package in editable mode along with the extra for the LLM provider
-you want to use:
+Install in editable mode with the Azure extra:
 
 ```bash
-# Anthropic
-pip install -e ".[anthropic]"
-
-# Azure AI Inference (Llama, etc.)
 pip install -e ".[azure]"
 ```
 
@@ -26,185 +21,128 @@ pip install -e ".[azure]"
 
 ### As a library
 
+Endpoint, credential, and API style are picked up from the corresponding
+`AZURE_INFERENCE_*` environment variables when omitted from the config:
+
 ```python
 from akoma_markup import convert
 
-# Basic usage
 result = convert(
-    pdf_path="input_pdf.pdf",
+    pdf_path="input.pdf",
     llm_config={
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-20250514",
-        # api_key picked up from ANTHROPIC_API_KEY if omitted
+        "provider": "azure",
+        "model": "<deployment-name>",
     },
-    output_path="output/bnss_markup.txt",
-)
-print(result)  # path to the markup file
-
-# With document metadata (recommended for proper identification)
-result = convert(
-    pdf_path="bnss_2023.pdf",
-    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    output_path="output/bnss_markup.txt",
+    output_path="output/markup.txt",
     document_name="Bharatiya Nagarik Suraksha Sanhita 2023",
     act_number="46 of 2023",
     replaces="Criminal Procedure Code (CrPC) 1973",
 )
-
-# For IT Act (no replaces field)
-result = convert(
-    pdf_path="IT_Act_2021.pdf",
-    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    document_name="Information Technology Act 2000",
-    act_number="21 of 2000",
-)
+print(result)  # path to the markup file
 ```
 
 ### As a CLI
 
 ```bash
-# Inline config
-akoma-markup input_pdf.pdf \
-  --llm-inline '{"provider": "anthropic", "model": "claude-sonnet-4-20250514"}' \
-  -o output/bnss_markup.txt
+# Read all credentials from a .env file (recommended)
+akoma-markup input.pdf --llm-env .env -o output/markup.txt
 
-# From a JSON file
-akoma-markup input_pdf.pdf --llm-json llm_config.json
-
-# From a .env file
-akoma-markup input_pdf.pdf --llm-env .env
+# Or load the LLM config from a JSON file
+akoma-markup input.pdf --llm-json llm_config.json
 ```
+
+See [`.env.sample`](.env.sample) for the full set of supported environment
+variables.
 
 ## LLM configuration
 
-`llm_config` is a dict with a required `provider` field plus provider-specific
-credentials. Common fields: `model`, `temperature` (default `0`), `max_tokens`
-(default `4096`).
-
-### Anthropic
-
-```python
-{
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
-    "api_key": "sk-ant-...",  # or set ANTHROPIC_API_KEY
-}
-```
-
-### Azure AI Inference
+`llm_config` is a dict with two required fields — `provider` (always
+`"azure"`) and `model` — plus Azure credentials. **There are no built-in
+model defaults**: an unspecified `model` raises `ValueError` immediately.
+Optional knobs: `temperature` (default `0`), `max_tokens` (default `4096`).
 
 ```python
 {
     "provider": "azure",
     "endpoint": "https://<your-resource>.cognitiveservices.azure.com/openai/v1/",
-    "credential": "<api-key>",  # or set AZURE_INFERENCE_CREDENTIAL
-    "model": "Llama-3.3-70B-Instruct",  # must match a deployed model
+    "credential": "<api-key>",
+    "model": "<deployment-name>",   # must match a deployed model
+    "api_style": "azure-inference", # one of: chat | responses | azure-inference
 }
 ```
 
-Environment variable fallbacks:
-`AZURE_INFERENCE_ENDPOINT`, `AZURE_INFERENCE_CREDENTIAL`.
-
-When using `--llm-env`, the CLI reads `PROVIDER`, `AZURE_INFERENCE_ENDPOINT`,
-`AZURE_INFERENCE_CREDENTIAL`, `AZURE_MODEL_ID`, `ANTHROPIC_API_KEY`, and
-`ANTHROPIC_MODEL_ID` from the file.
+Environment-variable equivalents: `AZURE_INFERENCE_ENDPOINT`,
+`AZURE_INFERENCE_KEY`, `AZURE_INFERENCE_MODEL_ID`, `AZURE_INFERENCE_API_STYLE`.
 
 ## Table rescue (optional)
 
-PDFs that contain tables come out garbled from `pdfplumber` because column
-structure is lost when the page is flattened to text. To fix this, `convert`
-can optionally re-extract table-bearing pages through Azure Document
-Intelligence OCR (which preserves tables as markdown pipe blocks) and splice
-the result back into the per-page text stream. The downstream LLM converts
-those markdown tables into bluebell `TABLE` blocks during normal section
-conversion.
+PDFs with embedded tables come out garbled from `pdfplumber` because column
+structure is lost when the page is flattened to text. `convert` can
+optionally re-extract table-bearing pages through a multimodal vision LLM
+(which renders the page as markdown with tables in pipe format), then
+convert those tables deterministically into bluebell `TABLE` blocks and
+splice the result back into the per-page text stream at sentinel positions
+— so table data never passes through the section-conversion LLM.
 
-This requires an Azure API key with access to a Document Intelligence
-deployment. The endpoint can be passed explicitly or read from the
-`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` environment variable; the API key
-falls back to `AZURE_API_KEY`.
+Three modes — all use the same vision LLM:
 
-Three modes:
+- `declared` — you list the table pages yourself. Cheapest; use when you
+  already know which pages contain tables.
+- `auto` — the vision LLM scans every page image and flags table pages
+  (cheap YES/NO call); only flagged pages are re-extracted (heavier
+  per-page call). Best cost / coverage tradeoff.
+- `full` — every page is re-extracted. Most expensive but guaranteed not to
+  miss anything.
 
-- `declared` — you list the table pages yourself. Cheapest and most
-  reliable. Use this when you already know which pages have tables.
-- `heuristic` — `pdfplumber.find_tables()` flags pages that contain a
-  ruled table. Works well for PDFs with visible cell borders; misses
-  whitespace-aligned tables.
-- `full` — every page is sent to Azure OCR. Slowest and most expensive,
-  but guaranteed to catch every table.
+All three modes require `AZURE_VISION_KEY`, `AZURE_VISION_ENDPOINT`,
+`AZURE_VISION_MODEL`, and `AZURE_VISION_API_STYLE`.
 
 ### As a library
 
 ```python
-from akoma_markup import convert
-
-# Declared mode: you know which pages contain tables
 result = convert(
     pdf_path="banking_act.pdf",
-    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    table_mode="declared",
-    table_pages=[12, 18, 19, 25],
-    azure_api_key="<azure-key>",  # or set AZURE_API_KEY
-    azure_ocr_endpoint="https://<resource>.services.ai.azure.com/...",  # optional
-)
-
-# Heuristic mode: let pdfplumber flag table pages
-result = convert(
-    pdf_path="banking_act.pdf",
-    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    table_mode="heuristic",
-    azure_api_key="<azure-key>",
-)
-
-# Full mode: OCR every page
-result = convert(
-    pdf_path="banking_act.pdf",
-    llm_config={"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    table_mode="full",
-    azure_api_key="<azure-key>",
+    llm_config={"provider": "azure", "model": "<deployment-name>"},
+    table_mode="declared",                       # or "auto", "full"
+    table_pages=[12, 18, 19, 25],                # required when "declared"
+    azure_vision_key="<azure-key>",              # or via AZURE_VISION_KEY
+    azure_vision_endpoint="https://...",         # or via AZURE_VISION_ENDPOINT
+    azure_vision_model="<vision-deployment>",    # or via AZURE_VISION_MODEL
+    azure_vision_api_style="chat",               # or via AZURE_VISION_API_STYLE
 )
 ```
 
 ### As a CLI
 
 ```bash
-# Declared mode (--table-pages accepts comma + range syntax)
 akoma-markup banking_act.pdf \
   --llm-env .env \
   --table-mode declared \
-  --table-pages "12,18-19,25" \
-  --azure-api-key "<azure-key>"
-
-# Heuristic mode
-akoma-markup banking_act.pdf \
-  --llm-env .env \
-  --table-mode heuristic
-
-# Full mode (OCR every page)
-akoma-markup banking_act.pdf \
-  --llm-env .env \
-  --table-mode full \
-  --azure-ocr-endpoint "https://<resource>.services.ai.azure.com/..."
+  --table-pages "12,18-19,25"
 ```
 
-`--azure-api-key` and `--azure-ocr-endpoint` fall back to `AZURE_API_KEY`
-and `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` (read from `--llm-env` if
-provided, or from the process environment).
+`--table-pages` accepts comma + range syntax. With `--llm-env`, the vision
+credentials are read from the `.env` file; explicit flags
+(`--azure-vision-key`, `--azure-vision-endpoint`, `--azure-vision-model`)
+override the file values when needed.
 
 ## Output
 
-Running `convert` produces:
+Running `convert` writes:
 
-- `<output>.txt` — the Akoma Ntoso plaintext markup
-- `<output>.meta.json` — per-section conversion status, errors, chapter info, and document metadata
-- `<output>.ocr.txt` — the raw OCR text extracted from the PDF
-- `<output-dir>/.akoma_checkpoints/` — intermediate per-section cache that lets
-  a failed run resume without re-calling the LLM for already-converted sections
+- `<output_path>` — the Akoma Ntoso plaintext markup
+- `<output_path>.meta.json` — conversion summary (sections, chapters, errors,
+  document metadata)
+- `<output_path>.ocr.txt` — raw text extracted from the PDF
+- `<output_dir>/.akoma_checkpoints/` — intermediate per-section cache; lets a
+  failed run resume without re-calling the LLM for already-converted sections
+
+A few debug artefacts are also written next to the markup
+(`*.raw_text_debug.txt`, `*.parser_debug.json`, `*.sections_debug.tsv`, and
+— when `table_mode` is set — `*.table_regions_debug.txt`); they're useful
+for diagnosing parser misalignment and can be safely ignored or deleted.
 
 ### Metadata file structure
-
-The `.meta.json` file includes:
 
 ```json
 {
@@ -212,41 +150,56 @@ The `.meta.json` file includes:
   "sections_converted": 531,
   "chapters": 20,
   "errors": 0,
-  "ocr_file": "output/bnss_markup.ocr.txt",
+  "ocr_file": "output/markup.ocr.txt",
   "document": "Bharatiya Nagarik Suraksha Sanhita 2023",
   "act_number": "46 of 2023",
   "replaces": "Criminal Procedure Code (CrPC) 1973"
 }
 ```
 
-Note: `document`, `act_number`, and `replaces` are only included when provided.
+`document`, `act_number`, and `replaces` are included only when provided.
 
 ## Project layout
 
 ```
 src/akoma_markup/
-  __init__.py     # convert() entry point
-  extractor.py    # pdfplumber text extraction
-  parser.py       # TOC + section parsing
-  converter.py    # LangChain chain + per-section processing
-  llm.py          # provider config → chat model
-  writer.py       # markup + metadata output
-  cli.py          # click-based CLI
+  __init__.py            # public convert() entry point
+  cli.py                 # click-based CLI
+  conversion.py          # section → markup chain + checkpointed runner
+  output.py              # markup / metadata / OCR-text writers
+  parsing/
+    text/
+      chapter_section_mapping.py   # TOC + section-body parsing
+    tables/
+      rescue.py          # table-rescue orchestrator (declared/auto/full)
+      render.py          # markdown → bluebell TABLE
+  util/
+    pdf/
+      text.py            # pdfplumber text extraction
+      images.py          # pypdfium2 rasterization + data URLs
+    llm/
+      factory.py         # provider config → LangChain chat model
+      vision.py          # vision-LLM client (page classification + extraction)
+      azure_api.py       # ApiMode literal + validator
 ```
 
 ## Troubleshooting
 
+- **`ValueError: ... must include a 'model' field`** — there are no model
+  defaults. Set `AZURE_INFERENCE_MODEL_ID` (for the section-conversion LLM)
+  or `AZURE_VISION_MODEL` (for table rescue) in your `.env`, or pass
+  `model` / the matching `azure_vision_model` arg explicitly.
 - **`Error code: 404 - Resource not found` on every section (Azure):** the
-  `model` value does not match an active deployment on your endpoint. Check
-  your Azure AI Foundry / AI Studio deployments and use the exact deployment
-  name.
+  `model` value does not match an active deployment. Check Azure AI Foundry /
+  AI Studio and use the exact deployment name.
 - **Empty output file with "N sections failed conversion":** every LLM call
-  failed. Check credentials, model name, and network access, then rerun — the
-  checkpoint cache will skip any sections that did succeed.
+  failed. Check credentials, model name, and network access, then rerun —
+  the checkpoint cache will skip sections that did succeed.
 
 ## License
 
-Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE)
+Licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE)
 (AGPL-3.0-or-later). If you run a modified version of this software as a
 network service, you must make the modified source code available to its
 users.
