@@ -1,12 +1,12 @@
 """Optional table-rescue preprocessing for PDFs with embedded tables.
 
 pdfplumber flattens tables into garbled text because column structure is lost.
-This module re-extracts affected regions via Azure OCR (which emits tables as
-clean markdown), groups consecutive rescued pages into "regions" (one logical
-table = one region, even when it spans pages), and splices a sentinel string
-``<<TABLE_REGION:N>>`` into ``per_page_text`` at the position of each region.
-The actual OCR markdown for each region is returned separately so callers
-can:
+This module re-extracts affected pages via a multimodal vision LLM (which
+can render each page as markdown with tables in pipe format), groups
+consecutive rescued pages into "regions" (one logical table = one region,
+even when it spans pages), and splices a sentinel string
+``<<TABLE_REGION:N>>`` into ``per_page_text`` at the position of each
+region. The per-region markdown is returned separately so callers can:
 
   - keep table content OUT of the section-conversion LLM's input (the LLM
     sees only the small sentinel placeholder, not 200 rows of balance-sheet
@@ -15,11 +15,11 @@ can:
     and splice the resulting bluebell ``TABLE`` block at the sentinel's
     position after the section LLM call returns.
 
-Three detection strategies:
+Three detection strategies — all use the same vision LLM endpoint:
     - "declared" : user lists the table pages (cheapest, most reliable)
-    - "auto"     : a vision LLM looks at every page image and flags tables;
-                   only flagged pages get OCR'd
-    - "full"     : OCR every page (no detection)
+    - "auto"     : vision LLM classifies every page (cheap YES/NO);
+                   only flagged pages are re-extracted
+    - "full"     : every page is re-extracted (no classification step)
 """
 
 from __future__ import annotations
@@ -27,12 +27,11 @@ from __future__ import annotations
 import json
 import re
 import sys
-import tempfile
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 
 from ...util.pdf.images import render_pages
-from .azure_ocr import AzureOCR
 from ...util.llm.vision import VisionClient
 
 TableMode = Literal["declared", "auto", "full"]
@@ -53,6 +52,24 @@ _TABLE_DETECTION_PROMPT = (
     "Ignore: ordinary paragraphs, multi-column running prose, bulleted lists, "
     "section headings.\n"
     "Reply with a single token: YES or NO."
+)
+
+
+_TABLE_EXTRACTION_PROMPT = (
+    "Extract the full content of this single page from a legislative or "
+    "regulatory document as GitHub-flavoured markdown. Preserve the "
+    "original reading order.\n\n"
+    "Render every tabular layout (ruled grids, schedule/form layouts, "
+    "balance-sheet style two-column ledgers, numerical tables with column "
+    "headers) as a markdown PIPE table:\n"
+    "  | header 1 | header 2 |\n"
+    "  | --- | --- |\n"
+    "  | cell | cell |\n"
+    "One row per ruled row; use empty cells for blanks. Do not invent "
+    "data — copy text exactly as printed (punctuation, case, numbers).\n\n"
+    "Headings and prose surrounding tables must appear as ordinary "
+    "markdown lines (no pipes). Do not wrap output in code fences. "
+    "Do not add commentary, summaries, or notes. Return the markdown only."
 )
 
 
@@ -87,40 +104,19 @@ def parse_page_spec(spec: str) -> list[int]:
     return sorted(pages)
 
 
-def _slice_pdf(pdf_path: Path, pages: list[int]) -> Path:
-    """Write a temp PDF containing only the given 1-indexed pages. Caller must delete."""
-    from pypdf import PdfReader, PdfWriter
-
-    reader = PdfReader(str(pdf_path))
-    writer = PdfWriter()
-    for p in pages:
-        if p < 1 or p > len(reader.pages):
-            raise ValueError(
-                f"Requested page {p} but PDF has {len(reader.pages)} pages"
-            )
-        writer.add_page(reader.pages[p - 1])
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-    with tmp as f:
-        writer.write(f)
-    return Path(tmp.name)
-
-
 def _cache_path(pdf_path: Path) -> Path:
-    """Return the path of the per-page OCR cache file for ``pdf_path``."""
+    """Return the path of the per-page extraction cache file for ``pdf_path``."""
     cache_dir = pdf_path.parent / ".akoma_checkpoints"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"{pdf_path.stem}_table_ocr_cache.json"
 
 
-def _load_ocr_cache(pdf_path: Path) -> dict[int, str]:
-    """Load the per-page OCR cache, validated against the PDF's mtime.
+def _load_cache(pdf_path: Path) -> dict[int, str]:
+    """Load the per-page extraction cache, validated against PDF mtime.
 
-    Returns ``{page_number: markdown}`` for pages already OCR'd in a prior
-    run. Returns ``{}`` if the cache is missing, unreadable, or stale (the
-    PDF has been modified since the cache was written). Caches written
-    under a different value shape (e.g. parsed JSON tables from an earlier
-    code revision) are also discarded.
+    Returns ``{page_number: markdown}`` for pages already extracted in a
+    prior run. Returns ``{}`` if the cache is missing, unreadable, stale,
+    or written under an incompatible value shape.
     """
     cache_path = _cache_path(pdf_path)
     if not cache_path.exists():
@@ -137,18 +133,12 @@ def _load_ocr_cache(pdf_path: Path) -> dict[int, str]:
         return {}
     pages = data.get("pages", {})
     if pages and not isinstance(next(iter(pages.values())), str):
-        # Cache from an earlier code revision had list-of-dicts values;
-        # re-fetch rather than crash on the type mismatch.
         return {}
     return {int(k): v for k, v in pages.items()}
 
 
-def _save_ocr_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
-    """Atomically persist the per-page OCR cache to disk.
-
-    Called after every successful page so a Ctrl+C during a long rescue run
-    doesn't lose pages that already came back from Azure.
-    """
+def _save_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
+    """Atomically persist the per-page extraction cache to disk."""
     cache_path = _cache_path(pdf_path)
     payload = {
         "pdf_mtime": pdf_path.stat().st_mtime,
@@ -160,63 +150,72 @@ def _save_ocr_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
     tmp.replace(cache_path)
 
 
-def _ocr_pages(pdf_path: Path, pages: list[int], ocr: AzureOCR) -> dict[int, str]:
-    """OCR the given pages of a PDF and return {page_number: markdown}.
+def _extract_pages(
+    pdf_path: Path,
+    pages: list[int],
+    vision: VisionClient,
+    dpi: int = 200,
+    max_workers: int = 4,
+) -> dict[int, str]:
+    """Render and extract the given pages via the vision LLM.
 
-    One request per page so we get a clean page_number -> markdown mapping
-    back and so we don't push a multi-megabyte merged PDF at the OCR
-    endpoint (some Mistral document-ai deployments reject those with 400).
+    Returns ``{page_number: markdown}`` covering every requested page.
 
-    Pages that were OCR'd in a prior run are loaded from
-    ``.akoma_checkpoints/<stem>_table_ocr_cache.json`` and not re-fetched.
-    The cache is saved incrementally after each successful page, so an
-    interrupted run preserves all pages that completed before the
-    interruption.
+    Pages already extracted in a prior run are loaded from the cache and
+    not re-fetched. The cache is saved incrementally after each successful
+    page, so an interrupted run preserves all pages that completed before
+    the interruption.
     """
-    cache = _load_ocr_cache(pdf_path)
+    cache = _load_cache(pdf_path)
     cached_pages = [p for p in pages if p in cache]
     missing_pages = [p for p in pages if p not in cache]
 
     per_page: dict[int, str] = {p: cache[p] for p in cached_pages}
     if cached_pages:
         print(
-            f"[tables]   OCR cache hit for {len(cached_pages)} page(s): "
+            f"[tables]   extraction cache hit for {len(cached_pages)} page(s): "
             f"{cached_pages}",
             file=sys.stderr,
         )
     if not missing_pages:
         return per_page
+
     print(
-        f"[tables]   OCR cache miss for {len(missing_pages)} page(s): "
+        f"[tables]   extraction cache miss for {len(missing_pages)} page(s): "
         f"{missing_pages}",
         file=sys.stderr,
     )
+    print(
+        f"[tables]   rendering {len(missing_pages)} page(s) at {dpi} DPI ...",
+        file=sys.stderr,
+    )
+    images = render_pages(pdf_path, missing_pages, dpi=dpi)
 
-    for i, p in enumerate(missing_pages, start=1):
-        single = _slice_pdf(pdf_path, [p])
-        try:
-            print(
-                f"[tables]   OCR page {p} ({i}/{len(missing_pages)}) ...",
-                file=sys.stderr,
-            )
-            md = ocr.extract_text(single)
-            per_page[p] = md
-            cache[p] = md
-            _save_ocr_cache(pdf_path, cache)  # checkpoint after each page
-            print(
-                f"[tables] --- OCR markdown for page {p} ---\n"
-                f"{md}\n"
-                f"[tables] --- end page {p} ---",
-                file=sys.stderr,
-            )
-        except Exception as exc:  # noqa: BLE001 — record and continue
-            print(
-                f"[tables]   OCR failed for page {p}: {exc}",
-                file=sys.stderr,
-            )
-            raise
-        finally:
-            single.unlink(missing_ok=True)
+    cache_lock = Lock()
+
+    def _on_done(pnum: int, md: str) -> None:
+        with cache_lock:
+            cache[pnum] = md
+            per_page[pnum] = md
+            _save_cache(pdf_path, cache)
+        print(
+            f"[tables] --- extracted markdown for page {pnum} ---\n"
+            f"{md}\n"
+            f"[tables] --- end page {pnum} ---",
+            file=sys.stderr,
+        )
+
+    print(
+        f"[tables]   extracting {len(missing_pages)} page(s) via vision LLM "
+        f"(max_workers={max_workers}) ...",
+        file=sys.stderr,
+    )
+    vision.extract_pages(
+        images,
+        _TABLE_EXTRACTION_PROMPT,
+        max_workers=max_workers,
+        on_page_done=_on_done,
+    )
     return per_page
 
 
@@ -294,63 +293,53 @@ def rescue_tables(
     pdf_path: Path,
     per_page_text: list[str],
     mode: TableMode,
-    azure_ocr_key: str,
-    azure_ocr_endpoint: str,
-    azure_ocr_model: str,
+    azure_vision_key: str,
+    azure_vision_endpoint: str,
+    azure_vision_model: str,
+    azure_vision_api_style: str,
     table_pages: list[int] | None = None,
-    azure_vision_key: str | None = None,
-    azure_vision_endpoint: str | None = None,
-    azure_vision_model: str | None = None,
-    azure_vision_api_style: str | None = None,
+    azure_vision_max_tokens: int | None = None,
 ) -> tuple[list[str], list[dict]]:
-    """Detect, OCR, and isolate tabular regions from a PDF's per-page text.
+    """Detect, extract, and isolate tabular regions from a PDF's per-page text.
 
     Returns ``per_page_text`` with each rescued region replaced by a
-    ``<<TABLE_REGION:N>>`` sentinel (so the section parser doesn't drag
-    table markdown into a section's content blob and blow the LLM's output
-    budget), plus a list of region dicts containing the actual OCR markdown.
+    ``<<TABLE_REGION:N>>`` sentinel, plus a list of region dicts containing
+    the extracted markdown.
 
     Args:
         pdf_path: Source PDF.
         per_page_text: pdfplumber output, one entry per page.
         mode: "declared", "auto", or "full".
-        azure_ocr_key: Azure OCR (Mistral) API key.
-        azure_ocr_endpoint: Azure OCR endpoint.
-        azure_ocr_model: Azure OCR model name.
-        table_pages: 1-indexed page list; required when mode == "declared".
-        azure_vision_key: Vision-LLM key for ``auto`` mode.
-        azure_vision_endpoint: Vision endpoint for ``auto`` mode.
-        azure_vision_model: Vision model/deployment for ``auto`` mode.
-        azure_vision_api_style: Vision API style for ``auto`` mode
+        azure_vision_key: Azure vision-LLM API key.
+        azure_vision_endpoint: Vision-LLM endpoint.
+        azure_vision_model: Vision-LLM model/deployment name.
+        azure_vision_api_style: Vision API style
             ('chat' | 'responses' | 'azure-inference').
+        table_pages: 1-indexed page list; required when mode == "declared".
 
     Returns:
         Tuple ``(per_page_text, table_regions)`` where:
           - ``per_page_text`` has the first page of each region replaced by
             the sentinel string and the rest of the region's pages blanked,
           - ``table_regions`` is a list of dicts ``{id, pages, markdown}``,
-            one per region, in document order. Each region's ``markdown`` is
-            the concatenated OCR output for its constituent pages.
+            one per region, in document order.
     """
-    ocr = AzureOCR(
-        api_key=azure_ocr_key,
-        endpoint=azure_ocr_endpoint,
-        model=azure_ocr_model,
+    vision = VisionClient(
+        api_key=azure_vision_key,
+        endpoint=azure_vision_endpoint,
+        deployment=azure_vision_model,
+        api_mode=azure_vision_api_style,
+        extraction_max_tokens=azure_vision_max_tokens,
     )
-    _key = azure_ocr_key or ""
+    _key = azure_vision_key or ""
     _redacted = (
         f"{_key[:8]}…{_key[-4:]}" if len(_key) > 12 else "<missing>"
-    )
-    print(
-        f"[tables] OCR endpoint={ocr.endpoint!r} model={ocr.model!r} "
-        f"api_key={_redacted}",
-        file=sys.stderr,
     )
     print(
         f"[tables] vision endpoint={azure_vision_endpoint!r} "
         f"model={azure_vision_model!r} "
         f"api_style={azure_vision_api_style!r} "
-        f"(used only in --table-mode=auto)",
+        f"api_key={_redacted}",
         file=sys.stderr,
     )
 
@@ -359,18 +348,12 @@ def rescue_tables(
             raise ValueError("mode='declared' requires table_pages=[...]")
         target_pages = table_pages
     elif mode == "auto":
-        vision = VisionClient(
-            api_key=azure_vision_key,
-            endpoint=azure_vision_endpoint,
-            deployment=azure_vision_model,
-            api_mode=azure_vision_api_style,
-        )
         target_pages = _detect_table_pages_vision(
             pdf_path, len(per_page_text), vision
         )
         if not target_pages:
             print(
-                "[tables] auto: vision LLM flagged no table pages, skipping OCR",
+                "[tables] auto: vision LLM flagged no table pages, skipping extraction",
                 file=sys.stderr,
             )
             return per_page_text, []
@@ -381,18 +364,18 @@ def rescue_tables(
     elif mode == "full":
         target_pages = list(range(1, len(per_page_text) + 1))
         print(
-            f"[tables] full: OCR'ing all {len(target_pages)} pages "
-            f"(no vision pre-flight)",
+            f"[tables] full: extracting all {len(target_pages)} pages "
+            f"(no classification step)",
             file=sys.stderr,
         )
     else:
         raise ValueError(f"Unknown table mode: {mode!r}")
 
     print(
-        f"[tables] OCR'ing {len(target_pages)} page(s) in mode={mode!r}",
+        f"[tables] extracting {len(target_pages)} page(s) in mode={mode!r}",
         file=sys.stderr,
     )
-    ocr_markdown = _ocr_pages(pdf_path, target_pages, ocr)
+    page_md = _extract_pages(pdf_path, target_pages, vision)
 
     page_groups = _group_consecutive_pages(target_pages)
     print(
@@ -405,7 +388,7 @@ def rescue_tables(
     table_regions: list[dict] = []
     for region_id, pages in enumerate(page_groups):
         region_md = "\n\n".join(
-            ocr_markdown[p] for p in pages if p in ocr_markdown
+            page_md[p] for p in pages if p in page_md
         ).strip()
         if not region_md:
             continue

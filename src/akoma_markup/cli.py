@@ -81,11 +81,11 @@ def main():
     "--table-mode",
     type=click.Choice(["declared", "auto", "full"]),
     default=None,
-    help="Enable Azure-OCR table rescue. "
+    help="Enable vision-LLM table rescue. "
          "'declared' takes --table-pages. "
-         "'auto' uses a vision LLM to find table pages, then OCRs only those. "
-         "'full' OCRs every page (no detection step — most expensive but "
-         "guaranteed not to miss anything). Off by default.",
+         "'auto' classifies every page (cheap), re-extracting only flagged "
+         "ones. 'full' re-extracts every page (no classification step — "
+         "most expensive but guaranteed not to miss anything). Off by default.",
 )
 @click.option(
     "--table-pages",
@@ -94,48 +94,38 @@ def main():
     help='Comma/range page list, e.g. "10,12-15". Required with --table-mode=declared.',
 )
 @click.option(
-    "--azure-ocr-key",
-    type=str,
-    default=None,
-    help="Azure OCR API key. Falls back to AZURE_OCR_KEY env var.",
-)
-@click.option(
-    "--azure-ocr-endpoint",
-    type=str,
-    default=None,
-    help="Azure OCR endpoint. Falls back to AZURE_OCR_ENDPOINT env var.",
-)
-@click.option(
-    "--azure-ocr-model",
-    type=str,
-    default=None,
-    help="Azure OCR model name. Falls back to AZURE_OCR_MODEL env var.",
-)
-@click.option(
     "--azure-vision-key",
     type=str,
     default=None,
-    help="Vision-LLM API key for --table-mode=auto. "
+    help="Vision-LLM API key. Required with --table-mode. "
          "Falls back to AZURE_VISION_KEY env var.",
 )
 @click.option(
     "--azure-vision-endpoint",
     type=str,
     default=None,
-    help="Vision-LLM endpoint for --table-mode=auto. "
+    help="Vision-LLM endpoint. Required with --table-mode. "
          "Falls back to AZURE_VISION_ENDPOINT env var.",
 )
 @click.option(
     "--azure-vision-model",
     type=str,
     default=None,
-    help="Vision-LLM model/deployment name for --table-mode=auto. "
+    help="Vision-LLM model/deployment name. Required with --table-mode. "
          "Falls back to AZURE_VISION_MODEL env var.",
 )
+@click.option(
+    "--azure-vision-max-tokens",
+    type=int,
+    default=None,
+    help="Per-page output token budget for the vision-LLM extraction call. "
+         "Falls back to AZURE_VISION_MAX_TOKENS env var, then 16384. Bump "
+         "this if you see truncation warnings on dense schedule pages.",
+)
 def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
-            table_mode, table_pages, azure_ocr_key, azure_ocr_endpoint,
-            azure_ocr_model, azure_vision_key, azure_vision_endpoint,
-            azure_vision_model):
+            table_mode, table_pages, azure_vision_key,
+            azure_vision_endpoint, azure_vision_model,
+            azure_vision_max_tokens):
     """Convert a IndiaCode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:
@@ -183,77 +173,64 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
                     key, _, value = line.partition("=")
                     env_file_vars[key.strip()] = value.strip().strip('"').strip("'")
 
-        resolved_ocr_key = (
-            azure_ocr_key
-            or env_file_vars.get("AZURE_OCR_KEY")
-            or os.environ.get("AZURE_OCR_KEY")
-        )
-        if not resolved_ocr_key:
-            raise click.ClickException(
-                "--table-mode requires --azure-ocr-key or AZURE_OCR_KEY in env"
-            )
-        resolved_ocr_endpoint = (
-            azure_ocr_endpoint
-            or env_file_vars.get("AZURE_OCR_ENDPOINT")
-            or os.environ.get("AZURE_OCR_ENDPOINT")
-        )
-        if not resolved_ocr_endpoint:
-            raise click.ClickException(
-                "--table-mode requires --azure-ocr-endpoint or "
-                "AZURE_OCR_ENDPOINT in env"
-            )
-        resolved_ocr_model = (
-            azure_ocr_model
-            or env_file_vars.get("AZURE_OCR_MODEL")
-            or os.environ.get("AZURE_OCR_MODEL")
-        )
-        if not resolved_ocr_model:
-            raise click.ClickException(
-                "--table-mode requires --azure-ocr-model or "
-                "AZURE_OCR_MODEL in env"
-            )
         resolved_vision_key = (
             azure_vision_key
             or env_file_vars.get("AZURE_VISION_KEY")
             or os.environ.get("AZURE_VISION_KEY")
         )
+        if not resolved_vision_key:
+            raise click.ClickException(
+                "--table-mode requires --azure-vision-key or "
+                "AZURE_VISION_KEY in env"
+            )
         resolved_vision_endpoint = (
             azure_vision_endpoint
             or env_file_vars.get("AZURE_VISION_ENDPOINT")
             or os.environ.get("AZURE_VISION_ENDPOINT")
         )
+        if not resolved_vision_endpoint:
+            raise click.ClickException(
+                "--table-mode requires --azure-vision-endpoint or "
+                "AZURE_VISION_ENDPOINT in env"
+            )
         resolved_vision_model = (
             azure_vision_model
             or env_file_vars.get("AZURE_VISION_MODEL")
             or os.environ.get("AZURE_VISION_MODEL")
         )
+        if not resolved_vision_model:
+            raise click.ClickException(
+                "--table-mode requires --azure-vision-model or "
+                "AZURE_VISION_MODEL in env"
+            )
         resolved_vision_api_style = (
             env_file_vars.get("AZURE_VISION_API_STYLE")
             or os.environ.get("AZURE_VISION_API_STYLE")
         )
-        if table_mode == "auto" and not (
-            resolved_vision_key and resolved_vision_endpoint
-            and resolved_vision_model
-        ):
+        if not resolved_vision_api_style:
             raise click.ClickException(
-                "--table-mode=auto requires --azure-vision-key, "
-                "--azure-vision-endpoint, and --azure-vision-model "
-                "(or AZURE_VISION_KEY / AZURE_VISION_ENDPOINT / "
-                "AZURE_VISION_MODEL in env)"
-            )
-        if table_mode == "auto" and not resolved_vision_api_style:
-            raise click.ClickException(
-                "--table-mode=auto requires AZURE_VISION_API_STYLE in env. "
+                "--table-mode requires AZURE_VISION_API_STYLE in env. "
                 "Set it to one of: 'chat', 'responses', 'azure-inference'."
             )
+        resolved_vision_max_tokens = azure_vision_max_tokens
+        if resolved_vision_max_tokens is None:
+            raw = (
+                env_file_vars.get("AZURE_VISION_MAX_TOKENS")
+                or os.environ.get("AZURE_VISION_MAX_TOKENS")
+            )
+            if raw:
+                try:
+                    resolved_vision_max_tokens = int(raw)
+                except ValueError:
+                    raise click.ClickException(
+                        f"AZURE_VISION_MAX_TOKENS must be an integer; got {raw!r}"
+                    )
     else:
-        resolved_ocr_key = None
-        resolved_ocr_endpoint = None
-        resolved_ocr_model = None
         resolved_vision_key = None
         resolved_vision_endpoint = None
         resolved_vision_model = None
         resolved_vision_api_style = None
+        resolved_vision_max_tokens = None
         if table_pages:
             raise click.ClickException(
                 "--table-pages requires --table-mode=declared"
@@ -267,13 +244,11 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
         output_path=output_path,
         table_mode=table_mode,
         table_pages=parsed_table_pages,
-        azure_ocr_key=resolved_ocr_key,
-        azure_ocr_endpoint=resolved_ocr_endpoint,
-        azure_ocr_model=resolved_ocr_model,
         azure_vision_key=resolved_vision_key,
         azure_vision_endpoint=resolved_vision_endpoint,
         azure_vision_model=resolved_vision_model,
         azure_vision_api_style=resolved_vision_api_style,
+        azure_vision_max_tokens=resolved_vision_max_tokens,
     )
     click.echo(result)
 

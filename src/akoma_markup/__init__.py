@@ -62,13 +62,11 @@ def convert(
     replaces: str | None = None,
     table_mode: str | None = None,
     table_pages: list[int] | None = None,
-    azure_ocr_key: str | None = None,
-    azure_ocr_endpoint: str | None = None,
-    azure_ocr_model: str | None = None,
     azure_vision_key: str | None = None,
     azure_vision_endpoint: str | None = None,
     azure_vision_model: str | None = None,
     azure_vision_api_style: str | None = None,
+    azure_vision_max_tokens: int | None = None,
 ) -> str:
     """Convert a legislative PDF to Akoma Ntoso markup.
 
@@ -85,19 +83,21 @@ def convert(
         table_mode: Optional table-rescue strategy. One of "declared", "auto",
             or "full". When None (default), only pdfplumber is used and tables
             in the PDF may be garbled in the output. When set, the selected
-            pages are sent to Azure OCR and converted to Laws.Africa TABLE
-            blocks. Requires the three ``azure_ocr_*`` arguments.
-            "auto" additionally requires the ``azure_vision_*`` arguments
-            (or the matching env vars) for the vision-LLM page classifier.
+            pages are re-extracted via the vision LLM (which renders the page
+            as markdown with pipe-format tables) and converted to Laws.Africa
+            TABLE blocks. Requires the four ``azure_vision_*`` arguments
+            below.
         table_pages: 1-indexed page list. Required when `table_mode="declared"`.
-        azure_ocr_key: Azure OCR API key. Required when `table_mode` is set.
-        azure_ocr_endpoint: Azure OCR endpoint. Required when `table_mode` is set.
-        azure_ocr_model: Azure OCR model name. Required when `table_mode` is set.
-        azure_vision_key: Vision-LLM API key (auto mode).
-        azure_vision_endpoint: Vision-LLM endpoint (auto mode).
-        azure_vision_model: Vision-LLM model/deployment name (auto mode).
+        azure_vision_key: Vision-LLM API key. Required when `table_mode` is set.
+        azure_vision_endpoint: Vision-LLM endpoint. Required when `table_mode` is set.
+        azure_vision_model: Vision-LLM model/deployment name. Required when
+            `table_mode` is set.
         azure_vision_api_style: Vision-LLM API style — one of 'chat',
-            'responses', 'azure-inference' (auto mode).
+            'responses', 'azure-inference'. Required when `table_mode` is set.
+        azure_vision_max_tokens: Per-page output token budget for the
+            extraction call. Defaults to ``AZURE_VISION_MAX_TOKENS`` env var
+            or 16384. Bump this if you see truncation warnings on dense
+            schedule pages.
 
     Returns:
         Path to the generated markup file.
@@ -118,22 +118,16 @@ def convert(
                 f"table_mode must be 'declared', 'auto', or 'full'; "
                 f"got {table_mode!r}"
             )
-        if not azure_ocr_key:
-            raise ValueError("table_mode requires azure_ocr_key")
-        if not azure_ocr_endpoint:
-            raise ValueError("table_mode requires azure_ocr_endpoint")
-        if not azure_ocr_model:
-            raise ValueError("table_mode requires azure_ocr_model")
+        if not azure_vision_key:
+            raise ValueError("table_mode requires azure_vision_key")
+        if not azure_vision_endpoint:
+            raise ValueError("table_mode requires azure_vision_endpoint")
+        if not azure_vision_model:
+            raise ValueError("table_mode requires azure_vision_model")
+        if not azure_vision_api_style:
+            raise ValueError("table_mode requires azure_vision_api_style")
         if table_mode == "declared" and not table_pages:
             raise ValueError("table_mode='declared' requires table_pages")
-        if table_mode == "auto":
-            if not (azure_vision_key and azure_vision_endpoint
-                    and azure_vision_model and azure_vision_api_style):
-                raise ValueError(
-                    "table_mode='auto' requires azure_vision_key, "
-                    "azure_vision_endpoint, azure_vision_model, and "
-                    "azure_vision_api_style"
-                )
 
     llm = build_llm(llm_config)
 
@@ -145,21 +139,19 @@ def convert(
     if table_mode is not None:
         from .parsing.tables.rescue import rescue_tables
         print(
-            f"Rescuing tables via Azure OCR (mode={table_mode!r}) ...",
+            f"Rescuing tables via vision LLM (mode={table_mode!r}) ...",
             file=sys.stderr,
         )
         per_page_text, table_regions = rescue_tables(
             pdf_path=pdf,
             per_page_text=per_page_text,
             mode=table_mode,
-            azure_ocr_key=azure_ocr_key,
-            azure_ocr_endpoint=azure_ocr_endpoint,
-            azure_ocr_model=azure_ocr_model,
-            table_pages=table_pages,
             azure_vision_key=azure_vision_key,
             azure_vision_endpoint=azure_vision_endpoint,
             azure_vision_model=azure_vision_model,
             azure_vision_api_style=azure_vision_api_style,
+            table_pages=table_pages,
+            azure_vision_max_tokens=azure_vision_max_tokens,
         )
         # Pre-render every region to a bluebell TABLE block (deterministic,
         # no LLM). The result is held in memory and spliced into the section
