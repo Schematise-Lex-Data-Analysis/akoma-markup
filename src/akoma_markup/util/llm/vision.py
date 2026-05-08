@@ -9,14 +9,16 @@ path to (a) classify which pages contain tables (cheap YES/NO call) and
 
 from __future__ import annotations
 
+import logging
 import os
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
 from .azure_api import ApiMode, validate_api_mode
 from ..pdf.images import image_to_data_url
+
+logger = logging.getLogger(__name__)
 
 
 # Azure's Responses API enforces max_output_tokens >= 16.
@@ -275,13 +277,12 @@ class VisionClient:
                     on_page_done(pnum, text)
 
         if truncated:
-            print(
-                f"[vision] WARNING: {len(truncated)} page(s) hit the "
-                f"max_tokens={budget} output cap and were truncated: "
-                f"pages {sorted(truncated)}. Set AZURE_VISION_MAX_TOKENS to "
-                f"a larger value (your deployment supports up to its own "
-                f"per-call output ceiling) or pass --azure-vision-max-tokens.",
-                file=sys.stderr,
+            logger.warning(
+                "%d page(s) hit the max_tokens=%d output cap and were "
+                "truncated: pages %s. Set AZURE_VISION_MAX_TOKENS to a "
+                "larger value (your deployment supports up to its own "
+                "per-call output ceiling) or pass --azure-vision-max-tokens.",
+                len(truncated), budget, sorted(truncated),
             )
 
         return results

@@ -1,9 +1,8 @@
 """CLI entrypoint for akoma-markup."""
 
 import json
+import logging
 import os
-import sys
-from pathlib import Path
 
 import click
 
@@ -43,7 +42,7 @@ def _config_from_env(env_path: str) -> dict:
 @click.group()
 def main():
     """Convert IndiaCode law PDFs to Akoma Ntoso markup."""
-    pass
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 @main.command()

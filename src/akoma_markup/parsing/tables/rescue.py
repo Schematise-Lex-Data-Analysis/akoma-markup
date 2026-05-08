@@ -25,14 +25,16 @@ Three detection strategies — all use the same vision LLM endpoint:
 from __future__ import annotations
 
 import json
+import logging
 import re
-import sys
 from pathlib import Path
 from threading import Lock
 from typing import Literal
 
 from ...util.pdf.images import render_pages
 from ...util.llm.vision import VisionClient
+
+logger = logging.getLogger(__name__)
 
 TableMode = Literal["declared", "auto", "full"]
 
@@ -114,10 +116,7 @@ def _load_cache(pdf_path: Path) -> dict[int, str]:
     except Exception:  # noqa: BLE001
         return {}
     if data.get("pdf_mtime") != pdf_path.stat().st_mtime:
-        print(
-            "[tables]   cache invalidated: PDF mtime changed",
-            file=sys.stderr,
-        )
+        logger.info("Cache invalidated: PDF mtime changed")
         return {}
     pages = data.get("pages", {})
     if pages and not isinstance(next(iter(pages.values())), str):
@@ -160,23 +159,18 @@ def _extract_pages(
 
     per_page: dict[int, str] = {p: cache[p] for p in cached_pages}
     if cached_pages:
-        print(
-            f"[tables]   extraction cache hit for {len(cached_pages)} page(s): "
-            f"{cached_pages}",
-            file=sys.stderr,
+        logger.info(
+            "Extraction cache hit for %d page(s): %s",
+            len(cached_pages), cached_pages,
         )
     if not missing_pages:
         return per_page
 
-    print(
-        f"[tables]   extraction cache miss for {len(missing_pages)} page(s): "
-        f"{missing_pages}",
-        file=sys.stderr,
+    logger.info(
+        "Extraction cache miss for %d page(s): %s",
+        len(missing_pages), missing_pages,
     )
-    print(
-        f"[tables]   rendering {len(missing_pages)} page(s) at {dpi} DPI ...",
-        file=sys.stderr,
-    )
+    logger.info("Rendering %d page(s) at %d DPI", len(missing_pages), dpi)
     images = render_pages(pdf_path, missing_pages, dpi=dpi)
 
     cache_lock = Lock()
@@ -186,17 +180,14 @@ def _extract_pages(
             cache[pnum] = md
             per_page[pnum] = md
             _save_cache(pdf_path, cache)
-        print(
-            f"[tables] --- extracted markdown for page {pnum} ---\n"
-            f"{md}\n"
-            f"[tables] --- end page {pnum} ---",
-            file=sys.stderr,
+        logger.debug(
+            "--- extracted markdown for page %d ---\n%s\n--- end page %d ---",
+            pnum, md, pnum,
         )
 
-    print(
-        f"[tables]   extracting {len(missing_pages)} page(s) via vision LLM "
-        f"(max_workers={max_workers}) ...",
-        file=sys.stderr,
+    logger.info(
+        "Extracting %d page(s) via vision LLM (max_workers=%d)",
+        len(missing_pages), max_workers,
     )
     vision.extract_pages(
         images,
@@ -215,16 +206,11 @@ def _detect_table_pages_vision(
     max_workers: int = 8,
 ) -> list[int]:
     """Render every page and ask the vision LLM which contain tables."""
-    print(
-        f"[tables] auto: rendering {total_pages} pages at {dpi} DPI ...",
-        file=sys.stderr,
-    )
+    logger.info("Auto-rendering %d pages at %d DPI", total_pages, dpi)
     images = render_pages(pdf_path, range(1, total_pages + 1), dpi=dpi)
-    print(
-        f"[tables] auto: classifying {total_pages} pages with vision LLM "
-        f"endpoint={vision.endpoint!r} deployment={vision.deployment!r} "
-        f"(max_workers={max_workers}) ...",
-        file=sys.stderr,
+    logger.info(
+        "Classifying %d pages with vision LLM endpoint=%r deployment=%r (max_workers=%d)",
+        total_pages, vision.endpoint, vision.deployment, max_workers,
     )
     answers = vision.classify_pages(
         images, _TABLE_DETECTION_PROMPT, max_workers=max_workers
@@ -236,10 +222,9 @@ def _detect_table_pages_vision(
         if reply.startswith("ERROR:"):
             error_count += 1
         is_table = reply.strip().upper().startswith("YES")
-        print(
-            f"[tables]   page {p}: {'TABLE' if is_table else 'no table'} "
-            f"(reply={reply[:60]!r})",
-            file=sys.stderr,
+        logger.debug(
+            "page %d: %s (reply=%r)",
+            p, "TABLE" if is_table else "no table", reply[:60],
         )
         if is_table:
             flagged.append(p)
@@ -250,10 +235,9 @@ def _detect_table_pages_vision(
             f"Check AZURE_VISION_ENDPOINT and AZURE_VISION_MODEL."
         )
     if error_count:
-        print(
-            f"[tables] auto: warning — {error_count}/{total_pages} pages "
-            f"errored during vision classification",
-            file=sys.stderr,
+        logger.warning(
+            "%d/%d pages errored during vision classification",
+            error_count, total_pages,
         )
     return flagged
 
@@ -323,12 +307,10 @@ def rescue_tables(
     _redacted = (
         f"{_key[:8]}…{_key[-4:]}" if len(_key) > 12 else "<missing>"
     )
-    print(
-        f"[tables] vision endpoint={azure_vision_endpoint!r} "
-        f"model={azure_vision_model!r} "
-        f"api_style={azure_vision_api_style!r} "
-        f"api_key={_redacted}",
-        file=sys.stderr,
+    logger.info(
+        "Vision endpoint=%r model=%r api_style=%r api_key=%s",
+        azure_vision_endpoint, azure_vision_model, azure_vision_api_style,
+        _redacted,
     )
 
     if mode == "declared":
@@ -340,36 +322,25 @@ def rescue_tables(
             pdf_path, len(per_page_text), vision
         )
         if not target_pages:
-            print(
-                "[tables] auto: vision LLM flagged no table pages, skipping extraction",
-                file=sys.stderr,
-            )
+            logger.info("Vision LLM flagged no table pages, skipping extraction")
             return per_page_text, []
-        print(
-            f"[tables] auto: vision LLM flagged pages {target_pages}",
-            file=sys.stderr,
-        )
+        logger.info("Vision LLM flagged pages %s", target_pages)
     elif mode == "full":
         target_pages = list(range(1, len(per_page_text) + 1))
-        print(
-            f"[tables] full: extracting all {len(target_pages)} pages "
-            f"(no classification step)",
-            file=sys.stderr,
+        logger.info(
+            "Full mode: extracting all %d pages (no classification step)",
+            len(target_pages),
         )
     else:
         raise ValueError(f"Unknown table mode: {mode!r}")
 
-    print(
-        f"[tables] extracting {len(target_pages)} page(s) in mode={mode!r}",
-        file=sys.stderr,
-    )
+    logger.info("Extracting %d page(s) in mode=%r", len(target_pages), mode)
     page_md = _extract_pages(pdf_path, target_pages, vision)
 
     page_groups = _group_consecutive_pages(target_pages)
-    print(
-        f"[tables] grouped {len(target_pages)} page(s) into "
-        f"{len(page_groups)} region(s): {page_groups}",
-        file=sys.stderr,
+    logger.info(
+        "Grouped %d page(s) into %d region(s): %s",
+        len(target_pages), len(page_groups), page_groups,
     )
 
     result = list(per_page_text)

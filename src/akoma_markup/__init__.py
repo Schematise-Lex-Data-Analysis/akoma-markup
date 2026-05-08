@@ -1,7 +1,7 @@
 """akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
+import logging
 import re
-import sys
 from pathlib import Path
 
 from . import debug_dump
@@ -17,6 +17,13 @@ from .parsing.text.chapter_section_mapping import (
 )
 from .output import write_markup, write_metadata
 
+logger = logging.getLogger(__name__)
+
+
+def _log_step(title: str) -> None:
+    """Emit a visually distinct step heading on a new line."""
+    logger.info("\n══ %s ══", title)
+
 
 # Recognises the rendered ``<<TABLE_REGION:N>>`` sentinel on its own line (with arbitrary indentation).
 _SENTINEL_LINE_RE = re.compile(
@@ -28,9 +35,9 @@ _SENTINEL_LINE_RE = re.compile(
 def _splice_sentinels(
     markup: str, table_blocks: dict[int, str]
 ) -> tuple[str, set[int]]:
-    """Replace each ``<<TABLE_REGION:N>>`` sentinel line with its TABLE block.
-    while maintaining the original indentation for the TABLE block. Returns the 
-    rewritten markup and the set of region IDs that were consumed (so the caller 
+    """Replace each ``<<TABLE_REGION:N>>`` sentinel line with its TABLE block,
+    while maintaining the original indentation for the TABLE block. 
+    Returns the rewritten markup and the set of region IDs that were consumed (so the caller 
     can identify trailing regions that need to be emitted as standalone TABLE blocks).
     """
     consumed: set[int] = set()
@@ -58,14 +65,14 @@ def _extract_and_rescue_tables(
     azure_vision_max_tokens: int | None,
 ) -> tuple[list[str], list[dict], dict[int, str]]:
     """Extract PDF text and optionally rescue tables via vision LLM."""
-    print("Extracting text from PDF ...", file=sys.stderr)
+    _log_step("Extracting text from PDF")
     per_page_text = extract_pdf_pages(str(pdf))
 
     table_regions: list[dict] = []
     table_blocks: dict[int, str] = {}
     if table_mode is not None:
         from .parsing.tables.rescue import rescue_tables
-        print(f"Rescuing tables via vision LLM (mode={table_mode!r}) ...", file=sys.stderr)
+        _log_step(f"Rescuing tables via vision LLM (mode={table_mode!r})")
         per_page_text, table_regions = rescue_tables(
             pdf_path=pdf,
             per_page_text=per_page_text,
@@ -78,7 +85,10 @@ def _extract_and_rescue_tables(
             azure_vision_max_tokens=azure_vision_max_tokens,
         )
         table_blocks = {r["id"]: render_region(r["markdown"]) for r in table_regions}
-        print(f"[tables] rescued {len(table_regions)} region(s); rendered {len(table_blocks)} bluebell TABLE blocks", file=sys.stderr)
+        logger.info(
+            "Rescued %d region(s); rendered %d bluebell TABLE blocks",
+            len(table_regions), len(table_blocks),
+        )
 
     return per_page_text, table_regions, table_blocks
 
@@ -89,14 +99,17 @@ def _parse_document_structure(
     pdf: Path,
 ) -> list[dict]:
     """Parse TOC, extract chapters and sections from raw text."""
+    _log_step("Parsing table of contents")
     raw_text = "\n".join(per_page_text)
     debug_dump.write_raw_text(raw_text, output_path)
 
     all_lines = raw_text.splitlines()
-    print("Parsing table of contents ...", file=sys.stderr)
     _chapters, section_names, toc_end_line = parse_toc(all_lines)
     chapter_ranges = extract_chapter_ranges(all_lines, section_names, toc_end_line)
-    print(f"Found {len(chapter_ranges)} chapters, {len(section_names)} sections (TOC ends at line {toc_end_line})", file=sys.stderr)
+    logger.info(
+        "Found %d chapters, %d sections (TOC ends at line %d)",
+        len(chapter_ranges), len(section_names), toc_end_line,
+    )
 
     content_text = "\n".join(all_lines[toc_end_line + 1:])
     sections = extract_section_content(content_text, section_names)
@@ -110,7 +123,7 @@ def _parse_document_structure(
             seen.add(sec["num"])
             unique.append(sec)
     sections = unique
-    print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
+    logger.info("%d unique sections ready for conversion", len(sections))
 
     debug_dump.write_parser_summary(pdf, toc_end_line, section_names, chapter_ranges, output_path)
     debug_dump.write_sections_tsv(sections, output_path)
@@ -129,6 +142,7 @@ def _process_conversion(
     table_blocks: dict[int, str],
 ) -> tuple[list[dict], int]:
     """Convert sections via LLM and splice table regions."""
+    _log_step("Converting sections to Akoma Ntoso")
     chain = build_chain(llm, document_name=document_name)
     checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -151,12 +165,18 @@ def _process_conversion(
             spliced, consumed = _splice_sentinels(conv["markup"], table_blocks)
             conv["markup"] = spliced
             consumed_region_ids |= consumed
-        print(f"[tables] spliced {len(consumed_region_ids)}/{len(table_blocks)} region(s) into section markup", file=sys.stderr)
+        logger.info(
+            "Spliced %d/%d table region(s) into section markup",
+            len(consumed_region_ids), len(table_blocks),
+        )
 
     # Add trailing table regions as standalone blocks
     trailing_regions = [r for r in table_regions if r["id"] not in consumed_region_ids]
     if trailing_regions:
-        print(f"[tables] {len(trailing_regions)} region(s) had no enclosing section; emitting as top-level TABLE block(s)", file=sys.stderr)
+        logger.info(
+            "%d table region(s) had no enclosing section; emitting as top-level block(s)",
+            len(trailing_regions),
+        )
         for r in trailing_regions:
             block = table_blocks.get(r["id"], "")
             if not block:
@@ -255,12 +275,13 @@ def convert(
     # Step 2: Parse document structure
     sections = _parse_document_structure(per_page_text, output_path, pdf)
 
-    # Step 3: Process conversion via LLM
+    # Step 3: Process conversion via LLM Inferencing
     converted, errors = _process_conversion(
         sections, llm, document_name, output_path, pdf, table_regions, table_blocks
     )
 
     # Step 4: Write final outputs
+    _log_step("Writing final outputs")
     markup_path = write_markup(converted, output_path)
     meta_path = write_metadata(
         converted, errors, output_path,
@@ -269,9 +290,9 @@ def convert(
         replaces=replaces
     )
 
-    print(f"Markup written to {markup_path}", file=sys.stderr)
-    print(f"Metadata written to {meta_path}", file=sys.stderr)
+    logger.info("Markup written to %s", markup_path)
+    logger.info("Metadata written to %s", meta_path)
     if errors:
-        print(f"{len(errors)} sections failed conversion", file=sys.stderr)
+        logger.warning("%d sections failed conversion", len(errors))
 
     return markup_path
