@@ -2,34 +2,30 @@
 
 import os
 
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
-DEFAULT_AZURE_MODEL = "Llama-3.3-70B-Instruct"
-
 
 def build_llm(config: dict):
     """Instantiate a LangChain chat model from a provider config.
 
     Args:
-        config: Dict with 'provider' (required) and provider-specific fields.
-            Supported providers: 'anthropic', 'azure'.
+        config: Dict with 'provider' and 'model' (both required) plus
+            provider-specific fields. Supported providers: 'anthropic', 'azure'.
 
             Common fields:
                 provider: str — 'anthropic' or 'azure'
-                model: str — model name (has sensible defaults per provider)
+                model: str — model name (REQUIRED; no default)
                 temperature: float — defaults to 0
                 max_tokens: int — defaults to 4096
 
             Provider-specific fields:
                 anthropic: api_key (or ANTHROPIC_API_KEY env var)
                 azure: endpoint, credential (or AZURE_INFERENCE_ENDPOINT,
-                       AZURE_INFERENCE_CREDENTIAL env vars)
+                       AZURE_INFERENCE_KEY env vars), api_style
 
     Returns:
         A LangChain BaseChatModel instance.
 
     Raises:
-        ValueError: If provider is missing or unsupported, or required credentials
-            are not provided.
+        ValueError: If provider, model, or required credentials are missing.
     """
     config = dict(config)  # don't mutate the caller's dict
     provider = config.pop("provider", None)
@@ -37,6 +33,11 @@ def build_llm(config: dict):
         raise ValueError("LLM config must include a 'provider' field")
 
     model = config.pop("model", None)
+    if not model:
+        raise ValueError(
+            "LLM config must include a 'model' field. Set ANTHROPIC_MODEL_ID or "
+            "AZURE_INFERENCE_MODEL_ID in your .env (matching the provider)."
+        )
     temperature = config.pop("temperature", 0)
     max_tokens = config.pop("max_tokens", 4096)
 
@@ -53,7 +54,7 @@ def build_llm(config: dict):
                 "Provide api_key in config or set ANTHROPIC_API_KEY env var"
             )
         return ChatAnthropic(
-            model=model or DEFAULT_ANTHROPIC_MODEL,
+            model=model,
             api_key=api_key,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -66,15 +67,15 @@ def build_llm(config: dict):
         credential = (
             config.pop("credential", None)
             or config.pop("api_key", None)
-            or os.environ.get("AZURE_INFERENCE_CREDENTIAL")
+            or os.environ.get("AZURE_INFERENCE_KEY")
         )
         if not endpoint or not credential:
             raise ValueError(
                 "Provide endpoint and credential in config or set "
-                "AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL env vars"
+                "AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_KEY env vars"
             )
 
-        deployment = model or DEFAULT_AZURE_MODEL
+        deployment = model
 
         # The deployment's API surface must be specified explicitly — different
         # Azure deployments expose different transports (chat/completions,
@@ -120,8 +121,6 @@ def build_llm(config: dict):
             max_tokens=max_tokens,
         )
 
-    # add support for huggingface provider
-    
     raise ValueError(
         f"Unknown provider '{provider}'. Supported: anthropic, azure"
     )

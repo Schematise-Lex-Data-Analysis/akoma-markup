@@ -53,7 +53,6 @@ def parse_markdown_tables(md: str) -> list[ParsedTable]:
     while i < len(lines):
         line = lines[i].strip()
         if line.startswith("|") and line.endswith("|"):
-            # Start of a pipe-block; collect contiguous pipe-delimited lines.
             block_rows: list[list[str]] = []
             while i < len(lines):
                 cur = lines[i].strip()
