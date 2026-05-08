@@ -133,14 +133,14 @@ Running `convert` writes:
 - `<output_path>` — the Akoma Ntoso plaintext markup
 - `<output_path>.meta.json` — conversion summary (sections, chapters, errors,
   document metadata)
-- `<output_path>.ocr.txt` — raw text extracted from the PDF
 - `<output_dir>/.akoma_checkpoints/` — intermediate per-section cache; lets a
   failed run resume without re-calling the LLM for already-converted sections
 
 A few debug artefacts are also written next to the markup
-(`*.raw_text_debug.txt`, `*.parser_debug.json`, `*.sections_debug.tsv`, and
-— when `table_mode` is set — `*.table_regions_debug.txt`); they're useful
-for diagnosing parser misalignment and can be safely ignored or deleted.
+(`*.ocr_debug.txt`, `*.raw_text_debug.txt`, `*.parser_debug.json`,
+`*.sections_debug.tsv`, and — when `table_mode` is set —
+`*.table_regions_debug.txt`); they're useful for diagnosing parser
+misalignment and can be safely ignored or deleted.
 
 ### Metadata file structure
 
@@ -150,7 +150,6 @@ for diagnosing parser misalignment and can be safely ignored or deleted.
   "sections_converted": 531,
   "chapters": 20,
   "errors": 0,
-  "ocr_file": "output/markup.ocr.txt",
   "document": "Bharatiya Nagarik Suraksha Sanhita 2023",
   "act_number": "46 of 2023",
   "replaces": "Criminal Procedure Code (CrPC) 1973"

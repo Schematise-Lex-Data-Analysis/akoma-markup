@@ -1,12 +1,12 @@
 """akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
-import json
 import re
 import sys
 from pathlib import Path
 
+from . import debug_dump
 from .conversion import build_chain, process_all_sections
-from .util.pdf.text import extract_pdf_pages, extract_pdf_text
+from .util.pdf.text import extract_pdf_pages
 from .util.llm.factory import build_llm
 from .parsing.tables.render import render_region
 from .parsing.text.chapter_section_mapping import (
@@ -15,12 +15,10 @@ from .parsing.text.chapter_section_mapping import (
     filter_sections_by_chapters,
     parse_toc,
 )
-from .output import write_markup, write_metadata, write_ocr_text
+from .output import write_markup, write_metadata
 
 
-# Recognises the rendered ``<<TABLE_REGION:N>>`` sentinel on its own line
-# (with arbitrary indentation). Used during splice to read the indent and
-# replace the line with a re-indented bluebell TABLE block.
+# Recognises the rendered ``<<TABLE_REGION:N>>`` sentinel on its own line (with arbitrary indentation).
 _SENTINEL_LINE_RE = re.compile(
     r"^(?P<indent>[ \t]*)<<TABLE_REGION:(?P<id>\d+)>>[ \t]*$",
     re.MULTILINE,
@@ -31,13 +29,9 @@ def _splice_sentinels(
     markup: str, table_blocks: dict[int, str]
 ) -> tuple[str, set[int]]:
     """Replace each ``<<TABLE_REGION:N>>`` sentinel line with its TABLE block.
-
-    The replacement block is re-indented to match the sentinel's leading
-    whitespace, so a sentinel sitting under SUBSEC (4-space indent) yields a
-    TABLE block whose ``TABLE`` keyword is also at 4-space indent and whose
-    children nest from there. Returns the rewritten markup and the set of
-    region IDs that were consumed (so the caller can identify trailing
-    regions that need to be emitted as standalone TABLE blocks).
+    while maintaining the original indentation for the TABLE block. Returns the 
+    rewritten markup and the set of region IDs that were consumed (so the caller 
+    can identify trailing regions that need to be emitted as standalone TABLE blocks).
     """
     consumed: set[int] = set()
 
@@ -51,6 +45,130 @@ def _splice_sentinels(
         return "\n".join(indent + ln if ln else "" for ln in block.split("\n"))
 
     return _SENTINEL_LINE_RE.sub(_replace, markup), consumed
+
+
+def _extract_and_rescue_tables(
+    pdf: Path,
+    table_mode: str | None,
+    table_pages: list[int] | None,
+    azure_vision_key: str | None,
+    azure_vision_endpoint: str | None,
+    azure_vision_model: str | None,
+    azure_vision_api_style: str | None,
+    azure_vision_max_tokens: int | None,
+) -> tuple[list[str], list[dict], dict[int, str]]:
+    """Extract PDF text and optionally rescue tables via vision LLM."""
+    print("Extracting text from PDF ...", file=sys.stderr)
+    per_page_text = extract_pdf_pages(str(pdf))
+
+    table_regions: list[dict] = []
+    table_blocks: dict[int, str] = {}
+    if table_mode is not None:
+        from .parsing.tables.rescue import rescue_tables
+        print(f"Rescuing tables via vision LLM (mode={table_mode!r}) ...", file=sys.stderr)
+        per_page_text, table_regions = rescue_tables(
+            pdf_path=pdf,
+            per_page_text=per_page_text,
+            mode=table_mode,
+            azure_vision_key=azure_vision_key,
+            azure_vision_endpoint=azure_vision_endpoint,
+            azure_vision_model=azure_vision_model,
+            azure_vision_api_style=azure_vision_api_style,
+            table_pages=table_pages,
+            azure_vision_max_tokens=azure_vision_max_tokens,
+        )
+        table_blocks = {r["id"]: render_region(r["markdown"]) for r in table_regions}
+        print(f"[tables] rescued {len(table_regions)} region(s); rendered {len(table_blocks)} bluebell TABLE blocks", file=sys.stderr)
+
+    return per_page_text, table_regions, table_blocks
+
+
+def _parse_document_structure(
+    per_page_text: list[str],
+    output_path: str,
+    pdf: Path,
+) -> list[dict]:
+    """Parse TOC, extract chapters and sections from raw text."""
+    raw_text = "\n".join(per_page_text)
+    debug_dump.write_raw_text(raw_text, output_path)
+
+    all_lines = raw_text.splitlines()
+    print("Parsing table of contents ...", file=sys.stderr)
+    _chapters, section_names, toc_end_line = parse_toc(all_lines)
+    chapter_ranges = extract_chapter_ranges(all_lines, section_names, toc_end_line)
+    print(f"Found {len(chapter_ranges)} chapters, {len(section_names)} sections (TOC ends at line {toc_end_line})", file=sys.stderr)
+
+    content_text = "\n".join(all_lines[toc_end_line + 1:])
+    sections = extract_section_content(content_text, section_names)
+    sections = filter_sections_by_chapters(sections, chapter_ranges)
+
+    # Remove duplicate sections
+    seen = set()
+    unique = []
+    for sec in sections:
+        if sec["num"] not in seen:
+            seen.add(sec["num"])
+            unique.append(sec)
+    sections = unique
+    print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
+
+    debug_dump.write_parser_summary(pdf, toc_end_line, section_names, chapter_ranges, output_path)
+    debug_dump.write_sections_tsv(sections, output_path)
+    debug_dump.write_ocr_text(content_text, output_path)
+
+    return sections
+
+
+def _process_conversion(
+    sections: list[dict],
+    llm,
+    document_name: str,
+    output_path: str,
+    pdf: Path,
+    table_regions: list[dict],
+    table_blocks: dict[int, str],
+) -> tuple[list[dict], int]:
+    """Convert sections via LLM and splice table regions."""
+    chain = build_chain(llm, document_name=document_name)
+    checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_filename = f"{pdf.stem}_conversion_checkpoint.json"
+    checkpoint_path = checkpoint_dir / checkpoint_filename
+    converted, errors = process_all_sections(chain, sections, checkpoint_path=checkpoint_path)
+
+    # Add chapter info to converted sections
+    sec_lookup = {s["num"]: s for s in sections}
+    for conv in converted:
+        orig = sec_lookup.get(conv["num"], {})
+        conv["chapter_roman"] = orig.get("chapter_roman", "NA")
+        conv["chapter_heading"] = orig.get("chapter_heading", "Unknown")
+        conv["kind"] = "section"
+
+    # Splice table sentinels with bluebell TABLE blocks
+    consumed_region_ids: set[int] = set()
+    if table_blocks:
+        for conv in converted:
+            spliced, consumed = _splice_sentinels(conv["markup"], table_blocks)
+            conv["markup"] = spliced
+            consumed_region_ids |= consumed
+        print(f"[tables] spliced {len(consumed_region_ids)}/{len(table_blocks)} region(s) into section markup", file=sys.stderr)
+
+    # Add trailing table regions as standalone blocks
+    trailing_regions = [r for r in table_regions if r["id"] not in consumed_region_ids]
+    if trailing_regions:
+        print(f"[tables] {len(trailing_regions)} region(s) had no enclosing section; emitting as top-level TABLE block(s)", file=sys.stderr)
+        for r in trailing_regions:
+            block = table_blocks.get(r["id"], "")
+            if not block:
+                continue
+            converted.append({
+                "num": f"TBL_R{r['id']}",
+                "markup": block,
+                "kind": "trailing_table",
+                "pages": r["pages"],
+            })
+
+    return converted, errors
 
 
 def convert(
@@ -114,10 +232,7 @@ def convert(
 
     if table_mode is not None:
         if table_mode not in {"declared", "auto", "full"}:
-            raise ValueError(
-                f"table_mode must be 'declared', 'auto', or 'full'; "
-                f"got {table_mode!r}"
-            )
+            raise ValueError(f"table_mode must be 'declared', 'auto', or 'full'; got {table_mode!r}")
         if not azure_vision_key:
             raise ValueError("table_mode requires azure_vision_key")
         if not azure_vision_endpoint:
@@ -131,218 +246,21 @@ def convert(
 
     llm = build_llm(llm_config)
 
-    print("Extracting text from PDF ...", file=sys.stderr)
-    per_page_text = extract_pdf_pages(str(pdf))
-
-    table_regions: list[dict] = []
-    table_blocks: dict[int, str] = {}
-    if table_mode is not None:
-        from .parsing.tables.rescue import rescue_tables
-        print(
-            f"Rescuing tables via vision LLM (mode={table_mode!r}) ...",
-            file=sys.stderr,
-        )
-        per_page_text, table_regions = rescue_tables(
-            pdf_path=pdf,
-            per_page_text=per_page_text,
-            mode=table_mode,
-            azure_vision_key=azure_vision_key,
-            azure_vision_endpoint=azure_vision_endpoint,
-            azure_vision_model=azure_vision_model,
-            azure_vision_api_style=azure_vision_api_style,
-            table_pages=table_pages,
-            azure_vision_max_tokens=azure_vision_max_tokens,
-        )
-        # Pre-render every region to a bluebell TABLE block (deterministic,
-        # no LLM). The result is held in memory and spliced into the section
-        # LLM's output at sentinel positions later.
-        table_blocks = {r["id"]: render_region(r["markdown"]) for r in table_regions}
-        print(
-            f"[tables] rescued {len(table_regions)} region(s); "
-            f"rendered {len(table_blocks)} bluebell TABLE blocks",
-            file=sys.stderr,
-        )
-        if table_regions:
-            regions_debug_path = Path(output_path or pdf.with_name(
-                f"{pdf.stem}_markup.txt"
-            )).with_suffix(".table_regions_debug.txt")
-            with open(regions_debug_path, "w") as f:
-                for r in table_regions:
-                    pages = r["pages"]
-                    span = (
-                        f"page {pages[0]}"
-                        if len(pages) == 1
-                        else f"pages {pages[0]}-{pages[-1]}"
-                    )
-                    f.write(f"{'=' * 80}\nREGION {r['id']}  ({span})\n{'=' * 80}\n\n")
-                    f.write("--- raw OCR markdown ---\n")
-                    f.write(r["markdown"])
-                    f.write("\n\n--- rendered bluebell ---\n")
-                    f.write(table_blocks.get(r["id"], "(none)"))
-                    f.write("\n\n")
-            print(
-                f"Table-region debug written to {regions_debug_path}",
-                file=sys.stderr,
-            )
-
-    raw_text = "\n".join(per_page_text)
-
-    raw_text_debug_path = Path(output_path).with_suffix(".raw_text_debug.txt")
-    raw_text_debug_path.write_text(raw_text)
-    print(f"Raw text (post-rescue) written to {raw_text_debug_path}", file=sys.stderr)
-
-    all_lines = raw_text.splitlines()
-
-    print("Parsing table of contents ...", file=sys.stderr)
-    _chapters, section_names, toc_end_line = parse_toc(all_lines)
-    chapter_ranges = extract_chapter_ranges(all_lines, section_names, toc_end_line)
-    print(
-        f"Found {len(chapter_ranges)} chapters, {len(section_names)} sections "
-        f"(TOC ends at line {toc_end_line})",
-        file=sys.stderr,
-    )
-    print("[parser] chapters detected:", file=sys.stderr)
-    for ch in _chapters:
-        print(f"  - {ch.get('roman', '?'):>6}  {ch.get('heading', '?')}",
-              file=sys.stderr)
-    print("[parser] chapter ranges:", file=sys.stderr)
-    for ch in chapter_ranges:
-        print(
-            f"  - CHAPTER {ch.get('roman', '?'):>6}  "
-            f"sections {ch.get('start', '?')}-{ch.get('end', '?')}  "
-            f"{ch.get('heading', '?')}",
-            file=sys.stderr,
-        )
-
-    print(f"OCR text (raw): {all_lines[toc_end_line + 1:][:10]}", file=sys.stderr)
-    content_text = "\n".join(all_lines[toc_end_line + 1:])
-    sections = extract_section_content(content_text, section_names)
-
-    sections = filter_sections_by_chapters(sections, chapter_ranges)
-
-    # Superficial parser-output dump: TOC structure with each chapter
-    # showing the sections it covers. Useful for spotting wrong TOC parsing
-    # or misaligned chapter ranges before blaming the LLM.
-    def _section_num_int(num_str: str) -> int | None:
-        m = re.match(r"(\d+)", num_str or "")
-        return int(m.group(1)) if m else None
-
-    chapters_summary: list[dict] = []
-    assigned_section_nums: set[str] = set()
-    for ch in chapter_ranges:
-        ch_sections = []
-        for sec in section_names:
-            n = _section_num_int(sec["num"])
-            if (
-                n is not None
-                and ch.get("start") is not None
-                and ch.get("end") is not None
-                and ch["start"] <= n <= ch["end"]
-            ):
-                ch_sections.append(
-                    {"num": sec["num"], "heading": sec["heading"]}
-                )
-                assigned_section_nums.add(sec["num"])
-        chapters_summary.append({
-            "roman": ch.get("roman"),
-            "heading": ch.get("heading"),
-            "section_range": [ch.get("start"), ch.get("end")],
-            "section_count": len(ch_sections),
-            "sections": ch_sections,
-        })
-
-    uncategorized = [
-        {"num": s["num"], "heading": s["heading"]}
-        for s in section_names
-        if s["num"] not in assigned_section_nums
-    ]
-
-    parser_debug_path = Path(output_path).with_suffix(".parser_debug.json")
-    parser_debug_path.write_text(json.dumps({
-        "pdf_file": str(pdf),
-        "toc_end_line": toc_end_line,
-        "section_count_in_toc": len(section_names),
-        "chapter_count": len(chapter_ranges),
-        "chapters": chapters_summary,
-        "uncategorized_sections": uncategorized,
-    }, indent=2, ensure_ascii=False, default=str))
-    print(f"Parser debug written to {parser_debug_path}", file=sys.stderr)
-
-    debug_tsv_path = Path(output_path).with_suffix(".sections_debug.tsv")
-    with open(debug_tsv_path, 'a') as debug_file:
-        import csv
-        writer = csv.writer(debug_file, delimiter='\t')
-        for sec in sections:
-            content = sec.get('content', '[No content]')
-            content_preview = content.replace('\n', ' ')
-            writer.writerow([sec['num'], sec['heading'], content_preview])
-            print(f"Section debug: number={sec['num']}, heading={sec['heading']}", file=sys.stderr)
-    seen = set()
-    unique = []
-    for sec in sections:
-        if sec["num"] not in seen:
-            seen.add(sec["num"])
-            unique.append(sec)
-    sections = unique
-    print(f"{len(sections)} unique sections ready for conversion", file=sys.stderr)
-
-    ocr_path = write_ocr_text(content_text, output_path)
-    print(f"OCR text written to {ocr_path}", file=sys.stderr)
-
-    chain = build_chain(llm, document_name=document_name)
-    checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_filename = f"{pdf.stem}_conversion_checkpoint.json"
-    checkpoint_path = checkpoint_dir / checkpoint_filename
-    converted, errors = process_all_sections(
-        chain, sections, checkpoint_path=checkpoint_path
+    # Step 1: Extract text and rescue tables if needed
+    per_page_text, table_regions, table_blocks = _extract_and_rescue_tables(
+        pdf, table_mode, table_pages, azure_vision_key, azure_vision_endpoint,
+        azure_vision_model, azure_vision_api_style, azure_vision_max_tokens
     )
 
-    sec_lookup = {s["num"]: s for s in sections}
-    for conv in converted:
-        orig = sec_lookup.get(conv["num"], {})
-        conv["chapter_roman"] = orig.get("chapter_roman", "NA")
-        conv["chapter_heading"] = orig.get("chapter_heading", "Unknown")
-        conv["kind"] = "section"
+    # Step 2: Parse document structure
+    sections = _parse_document_structure(per_page_text, output_path, pdf)
 
-    # The LLM is told to copy <<TABLE_REGION:N>> sentinels verbatim; here we
-    # swap them for the deterministically-rendered bluebell TABLE blocks so
-    # table data never passes through the LLM's drop/truncation tax.
-    consumed_region_ids: set[int] = set()
-    if table_blocks:
-        for conv in converted:
-            spliced, consumed = _splice_sentinels(conv["markup"], table_blocks)
-            conv["markup"] = spliced
-            consumed_region_ids |= consumed
-        print(
-            f"[tables] spliced {len(consumed_region_ids)}/{len(table_blocks)} "
-            f"region(s) into section markup",
-            file=sys.stderr,
-        )
+    # Step 3: Process conversion via LLM
+    converted, errors = _process_conversion(
+        sections, llm, document_name, output_path, pdf, table_regions, table_blocks
+    )
 
-    # Regions whose sentinel fell outside any TOC-listed section are
-    # emitted as standalone top-level TABLE blocks — no wrapper, no label.
-    trailing_regions = [
-        r for r in table_regions if r["id"] not in consumed_region_ids
-    ]
-    if trailing_regions:
-        print(
-            f"[tables] {len(trailing_regions)} region(s) had no enclosing "
-            f"section; emitting as top-level TABLE block(s)",
-            file=sys.stderr,
-        )
-        for r in trailing_regions:
-            block = table_blocks.get(r["id"], "")
-            if not block:
-                continue
-            converted.append({
-                "num": f"TBL_R{r['id']}",
-                "markup": block,
-                "kind": "trailing_table",
-                "pages": r["pages"],
-            })
-
-    ocr_path = write_ocr_text(content_text, output_path)
+    # Step 4: Write final outputs
     markup_path = write_markup(converted, output_path)
     meta_path = write_metadata(
         converted, errors, output_path,
@@ -357,4 +275,3 @@ def convert(
         print(f"{len(errors)} sections failed conversion", file=sys.stderr)
 
     return markup_path
-

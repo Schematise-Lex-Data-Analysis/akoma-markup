@@ -44,33 +44,21 @@ SENTINEL_FORMAT = "<<TABLE_REGION:{region_id}>>"
 SENTINEL_RE = re.compile(r"<<TABLE_REGION:(\d+)>>")
 
 
-_TABLE_DETECTION_PROMPT = (
-    "Look at this single page from a legislative or regulatory document.\n"
-    "Does it contain a TABLE — content arranged in clear rows and columns "
-    "(ruled grids, schedule/form layouts, balance-sheet style two-column "
-    "ledgers, or numerical tables with column headers)?\n"
-    "Ignore: ordinary paragraphs, multi-column running prose, bulleted lists, "
-    "section headings.\n"
-    "Reply with a single token: YES or NO."
-)
+_TABLE_DETECTION_PROMPT = """Look at this single page from a legislative or regulatory document.
+Does it contain a TABLE — content arranged in clear rows and columns (ruled grids, schedule/form layouts, balance-sheet style two-column ledgers, or numerical tables with column headers)?
+Ignore: ordinary paragraphs, multi-column running prose, bulleted lists, section headings.
+Reply with a single token: YES or NO."""
 
 
-_TABLE_EXTRACTION_PROMPT = (
-    "Extract the full content of this single page from a legislative or "
-    "regulatory document as GitHub-flavoured markdown. Preserve the "
-    "original reading order.\n\n"
-    "Render every tabular layout (ruled grids, schedule/form layouts, "
-    "balance-sheet style two-column ledgers, numerical tables with column "
-    "headers) as a markdown PIPE table:\n"
-    "  | header 1 | header 2 |\n"
-    "  | --- | --- |\n"
-    "  | cell | cell |\n"
-    "One row per ruled row; use empty cells for blanks. Do not invent "
-    "data — copy text exactly as printed (punctuation, case, numbers).\n\n"
-    "Headings and prose surrounding tables must appear as ordinary "
-    "markdown lines (no pipes). Do not wrap output in code fences. "
-    "Do not add commentary, summaries, or notes. Return the markdown only."
-)
+_TABLE_EXTRACTION_PROMPT = """Extract the full content of this single page from a legislative or regulatory document as GitHub-flavoured markdown. Preserve the original reading order.
+
+Render every tabular layout (ruled grids, schedule/form layouts, balance-sheet style two-column ledgers, numerical tables with column headers) as a markdown PIPE table:
+  | header 1 | header 2 |
+  | --- | --- |
+  | cell | cell |
+One row per ruled row; use empty cells for blanks. Do not invent data — copy text exactly as printed (punctuation, case, numbers).
+
+Headings and prose surrounding tables must appear as ordinary markdown lines (no pipes). Do not wrap output in code fences. Do not add commentary, summaries, or notes. Return the markdown only."""
 
 
 def parse_page_spec(spec: str) -> list[int]:
