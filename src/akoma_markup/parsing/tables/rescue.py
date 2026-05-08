@@ -94,21 +94,21 @@ def parse_page_spec(spec: str) -> list[int]:
     return sorted(pages)
 
 
-def _cache_path(pdf_path: Path) -> Path:
-    """Return the path of the per-page extraction cache file for ``pdf_path``."""
-    cache_dir = pdf_path.parent / ".akoma_checkpoints"
+def _cache_path(pdf_path: Path, output_path: str) -> Path:
+    """Return the per-page OCR cache file path under the output directory."""
+    cache_dir = Path(output_path).parent / ".akoma_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{pdf_path.stem}_table_ocr_cache.json"
+    return cache_dir / f"{pdf_path.stem}_table_ocr.json"
 
 
-def _load_cache(pdf_path: Path) -> dict[int, str]:
+def _load_cache(pdf_path: Path, output_path: str) -> dict[int, str]:
     """Load the per-page extraction cache, validated against PDF mtime.
 
     Returns ``{page_number: markdown}`` for pages already extracted in a
     prior run. Returns ``{}`` if the cache is missing, unreadable, stale,
     or written under an incompatible value shape.
     """
-    cache_path = _cache_path(pdf_path)
+    cache_path = _cache_path(pdf_path, output_path)
     if not cache_path.exists():
         return {}
     try:
@@ -124,9 +124,11 @@ def _load_cache(pdf_path: Path) -> dict[int, str]:
     return {int(k): v for k, v in pages.items()}
 
 
-def _save_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
+def _save_cache(
+    pdf_path: Path, output_path: str, page_md: dict[int, str]
+) -> None:
     """Atomically persist the per-page extraction cache to disk."""
-    cache_path = _cache_path(pdf_path)
+    cache_path = _cache_path(pdf_path, output_path)
     payload = {
         "pdf_mtime": pdf_path.stat().st_mtime,
         "pdf_name": pdf_path.name,
@@ -139,6 +141,7 @@ def _save_cache(pdf_path: Path, page_md: dict[int, str]) -> None:
 
 def _extract_pages(
     pdf_path: Path,
+    output_path: str,
     pages: list[int],
     vision: VisionClient,
     dpi: int = 200,
@@ -153,7 +156,7 @@ def _extract_pages(
     page, so an interrupted run preserves all pages that completed before
     the interruption.
     """
-    cache = _load_cache(pdf_path)
+    cache = _load_cache(pdf_path, output_path)
     cached_pages = [p for p in pages if p in cache]
     missing_pages = [p for p in pages if p not in cache]
 
@@ -179,7 +182,7 @@ def _extract_pages(
         with cache_lock:
             cache[pnum] = md
             per_page[pnum] = md
-            _save_cache(pdf_path, cache)
+            _save_cache(pdf_path, output_path, cache)
         logger.debug(
             "--- extracted markdown for page %d ---\n%s\n--- end page %d ---",
             pnum, md, pnum,
@@ -264,6 +267,7 @@ def _group_consecutive_pages(pages: list[int]) -> list[list[int]]:
 def rescue_tables(
     pdf_path: Path,
     per_page_text: list[str],
+    output_path: str,
     mode: TableMode,
     azure_vision_key: str,
     azure_vision_endpoint: str,
@@ -281,6 +285,8 @@ def rescue_tables(
     Args:
         pdf_path: Source PDF.
         per_page_text: pdfplumber output, one entry per page.
+        output_path: Final markup destination — used to anchor the OCR
+            cache directory (``<output_dir>/.akoma_cache/``).
         mode: "declared", "auto", or "full".
         azure_vision_key: Azure vision-LLM API key.
         azure_vision_endpoint: Vision-LLM endpoint.
@@ -335,7 +341,7 @@ def rescue_tables(
         raise ValueError(f"Unknown table mode: {mode!r}")
 
     logger.info("Extracting %d page(s) in mode=%r", len(target_pages), mode)
-    page_md = _extract_pages(pdf_path, target_pages, vision)
+    page_md = _extract_pages(pdf_path, output_path, target_pages, vision)
 
     page_groups = _group_consecutive_pages(target_pages)
     logger.info(

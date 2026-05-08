@@ -56,6 +56,7 @@ def _splice_sentinels(
 
 def _extract_and_rescue_tables(
     pdf: Path,
+    output_path: str,
     table_mode: str | None,
     table_pages: list[int] | None,
     azure_vision_key: str | None,
@@ -76,6 +77,7 @@ def _extract_and_rescue_tables(
         per_page_text, table_regions = rescue_tables(
             pdf_path=pdf,
             per_page_text=per_page_text,
+            output_path=output_path,
             mode=table_mode,
             azure_vision_key=azure_vision_key,
             azure_vision_endpoint=azure_vision_endpoint,
@@ -89,6 +91,10 @@ def _extract_and_rescue_tables(
             "Rescued %d region(s); rendered %d bluebell TABLE blocks",
             len(table_regions), len(table_blocks),
         )
+        if table_regions:
+            debug_dump.write_table_regions(
+                pdf, table_regions, table_blocks, output_path
+            )
 
     return per_page_text, table_regions, table_blocks
 
@@ -101,7 +107,7 @@ def _parse_document_structure(
     """Parse TOC, extract chapters and sections from raw text."""
     _log_step("Parsing table of contents")
     raw_text = "\n".join(per_page_text)
-    debug_dump.write_raw_text(raw_text, output_path)
+    debug_dump.write_raw_text(pdf, raw_text, output_path)
 
     all_lines = raw_text.splitlines()
     _chapters, section_names, toc_end_line = parse_toc(all_lines)
@@ -126,8 +132,8 @@ def _parse_document_structure(
     logger.info("%d unique sections ready for conversion", len(sections))
 
     debug_dump.write_parser_summary(pdf, toc_end_line, section_names, chapter_ranges, output_path)
-    debug_dump.write_sections_tsv(sections, output_path)
-    debug_dump.write_ocr_text(content_text, output_path)
+    debug_dump.write_sections_tsv(pdf, sections, output_path)
+    debug_dump.write_ocr_text(pdf, content_text, output_path)
 
     return sections
 
@@ -144,7 +150,7 @@ def _process_conversion(
     """Convert sections via LLM and splice table regions."""
     _log_step("Converting sections to Akoma Ntoso")
     chain = build_chain(llm, document_name=document_name)
-    checkpoint_dir = Path(output_path).parent / ".akoma_checkpoints"
+    checkpoint_dir = Path(output_path).parent / ".akoma_cache"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_filename = f"{pdf.stem}_conversion_checkpoint.json"
     checkpoint_path = checkpoint_dir / checkpoint_filename
@@ -268,8 +274,9 @@ def convert(
 
     # Step 1: Extract text and rescue tables if needed
     per_page_text, table_regions, table_blocks = _extract_and_rescue_tables(
-        pdf, table_mode, table_pages, azure_vision_key, azure_vision_endpoint,
-        azure_vision_model, azure_vision_api_style, azure_vision_max_tokens
+        pdf, output_path, table_mode, table_pages,
+        azure_vision_key, azure_vision_endpoint, azure_vision_model,
+        azure_vision_api_style, azure_vision_max_tokens,
     )
 
     # Step 2: Parse document structure

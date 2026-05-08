@@ -1,8 +1,10 @@
 """Sidecar debug-file writers for the conversion pipeline.
 
-Each function writes one inspection-only file next to the markup output.
-None of these feed back into conversion — they exist purely so failures
-can be diagnosed without re-running the pipeline.
+Each function writes one inspection-only file under
+``<output_dir>/.akoma_debug/`` (auto-created), prefixed with the PDF stem
+so multiple PDFs sharing the same output directory don't collide. None of
+these feed back into conversion — they exist purely so failures can be
+diagnosed without re-running the pipeline.
 """
 
 import csv
@@ -11,27 +13,38 @@ import re
 from pathlib import Path
 
 
-def write_raw_text(raw_text: str, output_path: str) -> Path:
-    """Dump post-table-rescue text to ``<output>.raw_text_debug.txt``."""
-    path = Path(output_path).with_suffix(".raw_text_debug.txt")
+_DEBUG_DIR_NAME = ".akoma_debug"
+
+
+def _debug_path(pdf: Path, output_path: str, name: str) -> Path:
+    """Resolve (and create) ``<output_dir>/.akoma_debug/<pdf_stem>_<name>``."""
+    debug_dir = Path(output_path).parent / _DEBUG_DIR_NAME
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    return debug_dir / f"{pdf.stem}_{name}"
+
+
+def write_raw_text(pdf: Path, raw_text: str, output_path: str) -> Path:
+    """Dump post-table-rescue text."""
+    path = _debug_path(pdf, output_path, "raw_text.txt")
     path.write_text(raw_text)
     return path
 
 
-def write_ocr_text(text: str, output_path: str) -> Path:
-    """Dump the post-TOC body text (LLM input) to ``<output>.ocr_debug.txt``."""
-    path = Path(output_path).with_suffix(".ocr_debug.txt")
+def write_ocr_text(pdf: Path, text: str, output_path: str) -> Path:
+    """Dump the post-TOC body text (LLM input)."""
+    path = _debug_path(pdf, output_path, "ocr.txt")
     path.write_text(text, encoding="utf-8")
     return path
 
 
 def write_table_regions(
+    pdf: Path,
     table_regions: list[dict],
     table_blocks: dict[int, str],
     output_path: str,
 ) -> Path:
     """Dump per-region OCR markdown + rendered bluebell side-by-side."""
-    path = Path(output_path).with_suffix(".table_regions_debug.txt")
+    path = _debug_path(pdf, output_path, "table_regions.txt")
     with open(path, "w") as f:
         for r in table_regions:
             pages = r["pages"]
@@ -50,7 +63,7 @@ def write_table_regions(
 
 
 def write_parser_summary(
-    pdf_path: Path,
+    pdf: Path,
     toc_end_line: int,
     section_names: list[dict],
     chapter_ranges: list[dict],
@@ -92,9 +105,9 @@ def write_parser_summary(
         if s["num"] not in assigned_section_nums
     ]
 
-    path = Path(output_path).with_suffix(".parser_debug.json")
+    path = _debug_path(pdf, output_path, "parser_summary.json")
     path.write_text(json.dumps({
-        "pdf_file": str(pdf_path),
+        "pdf_file": str(pdf),
         "toc_end_line": toc_end_line,
         "section_count_in_toc": len(section_names),
         "chapter_count": len(chapter_ranges),
@@ -104,9 +117,11 @@ def write_parser_summary(
     return path
 
 
-def write_sections_tsv(sections: list[dict], output_path: str) -> Path:
-    """Append num/heading/content rows to ``<output>.sections_debug.tsv``."""
-    path = Path(output_path).with_suffix(".sections_debug.tsv")
+def write_sections_tsv(
+    pdf: Path, sections: list[dict], output_path: str
+) -> Path:
+    """Append num/heading/content rows to a TSV."""
+    path = _debug_path(pdf, output_path, "sections.tsv")
     with open(path, "a") as f:
         writer = csv.writer(f, delimiter="\t")
         for sec in sections:

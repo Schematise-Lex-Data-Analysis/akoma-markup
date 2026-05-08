@@ -133,14 +133,16 @@ Running `convert` writes:
 - `<output_path>` — the Akoma Ntoso plaintext markup
 - `<output_path>.meta.json` — conversion summary (sections, chapters, errors,
   document metadata)
-- `<output_dir>/.akoma_checkpoints/` — intermediate per-section cache; lets a
-  failed run resume without re-calling the LLM for already-converted sections
-
-A few debug artefacts are also written next to the markup
-(`*.ocr_debug.txt`, `*.raw_text_debug.txt`, `*.parser_debug.json`,
-`*.sections_debug.tsv`, and — when `table_mode` is set —
-`*.table_regions_debug.txt`); they're useful for diagnosing parser
-misalignment and can be safely ignored or deleted.
+- `<output_dir>/.akoma_cache/` — per-PDF resume state:
+  `<pdf_stem>_conversion_checkpoint.json` (so a failed run skips
+  already-converted sections) and, when `--table-mode` is set,
+  `<pdf_stem>_table_ocr.json` (so re-runs skip already-extracted pages).
+- `<output_dir>/.akoma_debug/` — inspection-only artefacts, prefixed with
+  the PDF stem so multiple PDFs in the same output directory don't
+  collide: `<pdf_stem>_raw_text.txt`, `<pdf_stem>_ocr.txt`,
+  `<pdf_stem>_parser_summary.json`, `<pdf_stem>_sections.tsv`, and —
+  when `--table-mode` is set — `<pdf_stem>_table_regions.txt`. Useful for
+  diagnosing parser misalignment; safe to delete.
 
 ### Metadata file structure
 
