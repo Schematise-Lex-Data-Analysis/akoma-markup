@@ -22,11 +22,8 @@ def preprocess_pdf_text(text: str) -> str:
     Returns:
         Cleaned text with page artifacts removed.
     """
-    # Remove lines that are just page numbers (standalone digits)
-    # This handles cases where page numbers appear on their own line
     text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
 
-    # Remove common legislative document headers
     header_patterns = [
         r'THE GAZETTE OF INDIA\s*\n',
         r'EXTRAORDINARY\s*\n',
@@ -37,15 +34,11 @@ def preprocess_pdf_text(text: str) -> str:
     for pattern in header_patterns:
         text = re.sub(pattern, '\n', text, flags=re.IGNORECASE)
 
-    # Remove footnote markers before section numbers: e.g., "1[10." -> "10."
-    # This handles patterns like "1[10.", "2[11.", etc.
+    # Strip footnote markers around section numbers: ``1[10.`` → ``10.`` and
+    # ``10.]`` → ``10.`` — these come from amendment annotations in the gazette.
     text = re.sub(r'(\n|^)\s*\d+\[(\d+[A-Za-z]*\.)', r'\1\2', text)
-    
-    # Also handle closing brackets after section numbers if they exist
-    # e.g., "10.]" -> "10."
     text = re.sub(r'(\d+[A-Za-z]*\.)\]', r'\1', text)
 
-    # Normalize multiple newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -53,7 +46,6 @@ def preprocess_pdf_text(text: str) -> str:
 
 def _heading_similarity(heading1: str, heading2: str) -> float:
     """Calculate fuzzy similarity ratio between two headings (0.0 to 1.0)."""
-    # Normalize: lowercase, remove punctuation at end, extra spaces
     h1 = heading1.lower().strip().rstrip(".,;:-–—")
     h2 = heading2.lower().strip().rstrip(".,;:-–—")
     return difflib.SequenceMatcher(None, h1, h2).ratio()
@@ -169,32 +161,26 @@ def parse_toc(lines: list[str]) -> tuple[list[dict], list[dict], int]:
             sec_num = section_match.group(1)
             sec_heading = section_match.group(2).strip()
 
-            # Handle multi-line titles: check if next line continues the heading
-            # (doesn't start with a number pattern or CHAPTER/PART)
+            # Continue absorbing lines into the heading until something looks
+            # like a new section, chapter, schedule, all-caps title, or page number.
             j = i + 1
             while j < len(lines):
                 next_line = lines[j].strip()
-                # Stop if next line looks like a new section, chapter, or is empty
                 if not next_line:
                     break
-                if re.match(r"^\d+[A-Za-z]*\.\s+", next_line):  # New section
+                if re.match(r"^\d+[A-Za-z]*\.\s+", next_line):
                     break
                 if re.match(r"^(CHAPTER|PART)\s+", next_line, re.IGNORECASE):
                     break
-                # If it's all caps, might be a chapter title
                 if next_line.isupper() and len(next_line) > 10:
                     break
-                # Stop if line is just a page number (digits only)
                 if next_line.isdigit():
                     break
-                # Stop if line starts with "THE SCHEDULE" or similar schedule marker
                 if re.match(r"^THE\s+[A-Z]*\s*SCHEDULE", next_line, re.IGNORECASE):
                     break
-                # Otherwise, append to heading (with space)
                 sec_heading += " " + next_line
                 j += 1
 
-            # Clean up heading: remove trailing period if present
             sec_heading = sec_heading.rstrip('.')
             sections.append({"num": sec_num, "heading": sec_heading})
             toc_end_line = j - 1 if j > i + 1 else i
@@ -311,11 +297,12 @@ def filter_sections_by_chapters(
             if not num_match:
                 return {"roman": "NA", "heading": "Unknown"}
             num = int(num_match.group(1))
-            # Exact match within a chapter range
             for ch in chapter_ranges:
                 if ch["start"] <= num <= ch["end"]:
                     return {"roman": ch["roman"], "heading": ch["heading"]}
-            # Fallback: assign to nearest chapter by distance
+            # Fallback when the section number falls in a gap between chapter
+            # ranges (e.g. amendments inserted out of order): assign to whichever
+            # chapter's range it's closest to.
             best = None
             best_dist = float("inf")
             for ch in chapter_ranges:
@@ -363,25 +350,20 @@ def _find_section_boundary(
         Tuple of (start_pos, end_pos, context) where content should be extracted from,
         or (None, None, None) if not found. Context contains surrounding text.
     """
-    CONTEXT_WINDOW = 50  # Characters of context to capture around the match
+    CONTEXT_WINDOW = 50
 
-    # Phase 1: Simple string matching for section headings only (no regex)
-    # Search for exact heading match, case-insensitive using str.find()
     heading_lower = sec_heading.lower()
     text_lower = text.lower()
 
-    # Look for heading followed by newline or dash, starting from search_start
     pos = search_start
     while True:
         idx = text_lower.find(heading_lower, pos)
         if idx == -1:
             break
-        # Check if followed by whitespace+newline or whitespace+dash
         end_idx = idx + len(sec_heading)
         remaining = text[end_idx:end_idx + 10]
         if '\n' in remaining or any(d in remaining for d in ['—', '–', '-']):
             logger.debug(f"Section {sec_num}: Found via simple string match")
-            # Capture surrounding context
             context_start = max(0, idx - CONTEXT_WINDOW)
             context_end = min(len(text), end_idx + CONTEXT_WINDOW)
             context = {
@@ -393,11 +375,9 @@ def _find_section_boundary(
             return idx, end_idx, context
         pos = idx + 1
 
-    # Phase 2: Try simple section number pattern before expensive similarity search
+    # Cheaper number-pattern check before the similarity fallback below.
     logger.debug(f"Section {sec_num}: No exact heading match, trying simple number pattern")
-    
-    # Simple pattern: section number followed by period and text until newline or end
-    # This is much faster than the similarity search
+
     simple_pattern = rf"{re.escape(sec_num)}\.\s+(.+?)(?:\n|$)"
     simple_match = re.search(simple_pattern, text[search_start:])
     
@@ -415,37 +395,31 @@ def _find_section_boundary(
         }
         return idx, end_idx, context
 
-    # Phase 3: Fallback to similarity matching for <digit><letters?>.<whitespace><any><dash> patterns
-    # ONLY if enabled and text isn't too long
     logger.debug(f"Section {sec_num}: Trying similarity fallback (expensive)")
-    
-    # Limit search to next 5000 characters to avoid scanning entire document
+
+    # Cap the similarity search to a 5000-char window so this stays bounded
+    # on full-act texts.
     search_end = min(len(text), search_start + 5000)
     search_text = text[search_start:search_end]
-    
-    # Pattern: digit + optional letters, dot, whitespace, any characters, followed by dash
-    # This captures patterns like "1. Definitions —", "12. Some heading -", "1A. Heading —"
-    # WITH re.DOTALL: . matches newlines, allowing multi-line headings
+
+    # re.DOTALL is required so multi-line headings (split across page breaks)
+    # match as one candidate.
     similarity_pattern = rf"(\d+[A-Za-z]*\.\s*.+?)[—–]"
 
     candidates = []
     for match in re.finditer(similarity_pattern, search_text, flags=re.DOTALL):
-        # Extract just the heading part (after the number)
         full_match = match.group(1).strip()
-        # Remove the number prefix to get the heading
         heading_match = re.sub(r"^\d+[A-Za-z]*\.\s*", "", full_match)
         if heading_match:
             similarity = _heading_similarity(sec_heading, heading_match)
             candidates.append((match, similarity))
 
     if candidates:
-        # Sort by similarity and check best match
         candidates.sort(key=lambda x: x[1], reverse=True)
         best_match, best_similarity = candidates[0]
 
         if best_similarity >= 0.80:
             logger.debug(f"Section {sec_num}: Found via similarity match (sim={best_similarity:.2f})")
-            # Capture surrounding context
             idx = search_start + best_match.start()
             end_idx = search_start + best_match.end()
             context_start = max(0, idx - CONTEXT_WINDOW)
@@ -459,7 +433,6 @@ def _find_section_boundary(
             }
             return idx, end_idx, context
 
-    # Phase 4: No match found, proceed to next section
     logger.debug(f"Section {sec_num}: No boundary found, skipping")
     return None, None, None
 
@@ -482,22 +455,19 @@ def extract_section_content(
     """
     logger.debug(f"Starting section content extraction for {len(section_names)} sections")
 
-    # Pre-process text to handle page artifacts
     full_text = preprocess_pdf_text(full_text)
 
     sections_with_content = []
-    last_processed_boundary = 0  # Track the end of the last processed section
+    last_processed_boundary = 0
 
     for i, sec in enumerate(section_names):
         sec_num = sec["num"]
         sec_heading = sec["heading"]
 
-        # Find the start of this section, beginning search after last processed boundary
         start_result = _find_section_boundary(full_text, sec_num, sec_heading, last_processed_boundary)
         start_match_pos, end_idx, start_context = start_result
 
         if start_match_pos is None:
-            # Section not found
             fallback = "[Repealed/Omitted]" if (
                 "Repealed" in sec["heading"] or "Omitted" in sec["heading"]
             ) else ""
@@ -507,47 +477,34 @@ def extract_section_content(
             )
             continue
 
-        # Update the boundary to after this section's header
-        # Use end_idx which is the actual end position of the matched text
         last_processed_boundary = end_idx
 
-        # Find the end: search for the next section's number in the text
-        # Use string-based fencing - literally search for next section number
         end_pos = None
         end_context = None
         if i + 1 < len(section_names):
             next_sec_num = section_names[i + 1]["num"]
             next_sec_heading = section_names[i + 1]["heading"]
 
-            # Search for next section starting from current section's boundary
             next_result = _find_section_boundary(full_text, next_sec_num, next_sec_heading, last_processed_boundary)
             next_start_abs, _, end_context = next_result
 
             if next_start_abs is not None:
                 end_pos = next_start_abs
             else:
-                # Fallback: simple pattern match for next section
+                # Fallback when fuzzy matching fails: anchor on a literal "\nN. "
+                # at the start of a line — survives garbled neighbouring text.
                 next_pattern = rf"\n{re.escape(next_sec_num)}\.\s"
                 next_match = re.search(next_pattern, full_text[last_processed_boundary:])
                 if next_match:
                     end_pos = last_processed_boundary + next_match.start()
 
-        # Extract content
         if end_pos is not None:
             content = full_text[start_match_pos:end_pos]
         else:
             content = full_text[start_match_pos:]
 
-        # Clean up content
         content = content.strip()
 
-        # Remove section header line from content (keep only the body)
-        # content_lines = content.split('\n')
-        # if len(content_lines) > 1:
-        #    # First line is the header, rest is content
-        #    content = '\n'.join(content_lines[1:]).strip()
-
-        # Final cleanup
         content = re.sub(r"\n\d+\n", "\n", content)
         content = re.sub(r"\d+\[", "[", content)
 

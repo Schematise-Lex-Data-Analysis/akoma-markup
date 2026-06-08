@@ -5,35 +5,23 @@ from datetime import datetime
 from pathlib import Path
 
 
-def write_ocr_text(text: str, output_path: str) -> str:
-    """Write the raw OCR text to a file alongside the markup output.
-
-    Args:
-        text: The full extracted OCR text from the PDF.
-        output_path: Path to the markup file (OCR text is written next to it).
-
-    Returns:
-        The OCR text file path.
-    """
-    ocr_path = Path(output_path).with_suffix(".ocr.txt")
-    ocr_path.write_text(text, encoding="utf-8")
-    return str(ocr_path)
-
-
 def write_markup(sections: list[dict], output_path: str) -> str:
     """Write converted entries to a markup text file.
 
     Section entries (``kind`` is ``"section"`` or absent) are grouped by
-    chapter under ``CHAPTER`` dividers. Schedule entries (``kind ==
-    "schedule"``) are emitted at the end under a single ``SCHEDULES``
-    divider with no chapter wrapper — they're top-level structural
-    elements, peers of chapters, not children of one.
+    chapter under ``CHAPTER`` dividers. Trailing-table entries
+    (``kind == "trailing_table"``) are appended at the end with no wrapper
+    or label — just the bluebell TABLE block.
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    section_entries = [s for s in sections if s.get("kind") != "schedule"]
-    schedule_entries = [s for s in sections if s.get("kind") == "schedule"]
+    section_entries = [
+        s for s in sections if s.get("kind") != "trailing_table"
+    ]
+    trailing_tables = [
+        s for s in sections if s.get("kind") == "trailing_table"
+    ]
 
     with open(out, "w", encoding="utf-8") as f:
         current_chapter = None
@@ -47,21 +35,9 @@ def write_markup(sections: list[dict], output_path: str) -> str:
             f.write(sec["markup"])
             f.write("\n\n")
 
-        if schedule_entries:
-            f.write("\n\n" + "=" * 80 + "\n")
-            f.write("SCHEDULES\n")
-            f.write("=" * 80 + "\n\n")
-            for sch in schedule_entries:
-                pages = sch.get("pages") or []
-                if pages:
-                    span = (
-                        f"page {pages[0]}"
-                        if len(pages) == 1
-                        else f"pages {pages[0]}-{pages[-1]}"
-                    )
-                    f.write(f"# Source: {span}\n")
-                f.write(sch["markup"])
-                f.write("\n\n")
+        for tbl in trailing_tables:
+            f.write(tbl["markup"])
+            f.write("\n\n")
 
     return str(out)
 
@@ -94,10 +70,8 @@ def write_metadata(
         "sections_converted": len(sections),
         "chapters": len({sec.get("chapter_roman", "NA") for sec in sections}),
         "errors": len(errors),
-        "ocr_file": str(Path(output_path).with_suffix(".ocr.txt")),
     }
 
-    # Add document metadata if provided
     if document_name:
         metadata["document"] = document_name
     if act_number:

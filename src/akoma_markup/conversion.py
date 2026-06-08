@@ -1,7 +1,7 @@
 """LLM-based conversion of legislative sections to Akoma Ntoso markup."""
 
 import json
-import sys
+import logging
 import time
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +9,8 @@ from pathlib import Path
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+
+logger = logging.getLogger(__name__)
 
 CONVERSION_PROMPT_TEMPLATE = """You are converting {document_name} sections to Laws.Africa plaintext markup format.
 
@@ -195,9 +197,9 @@ def process_all_sections(
         if cp:
             results = cp["completed_sections"]
             start_index = cp["last_completed_index"] + 1
-            print(
-                f"Resuming from checkpoint: section {start_index + 1}/{len(sections)}",
-                file=sys.stderr,
+            logger.info(
+                "Resuming from checkpoint: section %d/%d",
+                start_index + 1, len(sections),
             )
 
     section_times: list[float] = []
@@ -223,10 +225,10 @@ def process_all_sections(
                 section_times.append(elapsed)
                 remaining = len(sections) - (i + 1)
                 pct = ((i + 1) / len(sections)) * 100
-                print(
-                    f"[{i + 1}/{len(sections)} {pct:.0f}%] Section {section['num']}: "
-                    f"{section['heading'][:60]}",
-                    file=sys.stderr,
+                logger.info(
+                    "[%d/%d %.0f%%] Section %s: %s",
+                    i + 1, len(sections), pct,
+                    section["num"], section["heading"][:60],
                 )
 
                 time.sleep(delay)
@@ -234,9 +236,9 @@ def process_all_sections(
                 if (i + 1) % batch_size == 0:
                     if checkpoint_path:
                         _save_checkpoint(checkpoint_path, i, results, len(sections))
-                    print(
-                        f"Batch {(i + 1) // batch_size} done, cooling {cfg['batch_delay']}s ...",
-                        file=sys.stderr,
+                    logger.info(
+                        "Batch %d done, cooling %ds",
+                        (i + 1) // batch_size, cfg["batch_delay"],
                     )
                     time.sleep(cfg["batch_delay"])
 
@@ -248,17 +250,15 @@ def process_all_sections(
                 if is_retryable and retry_count < cfg["max_retries"]:
                     retry_count += 1
                     wait = cfg["initial_backoff"] * (2 ** (retry_count - 1))
-                    print(
-                        f"Retryable error on section {section['num']} "
-                        f"(attempt {retry_count}/{cfg['max_retries']}), "
-                        f"waiting {wait}s ...",
-                        file=sys.stderr,
+                    logger.warning(
+                        "Retryable error on section %s (attempt %d/%d), waiting %ds",
+                        section["num"], retry_count, cfg["max_retries"], wait,
                     )
                     time.sleep(wait)
                 else:
-                    print(
-                        f"Error on section {section['num']}: {err_str[:120]}",
-                        file=sys.stderr,
+                    logger.error(
+                        "Error on section %s: %s",
+                        section["num"], err_str[:120],
                     )
                     errors.append({"num": section["num"], "error": err_str})
                     if checkpoint_path:
@@ -266,9 +266,9 @@ def process_all_sections(
                     break
 
         if not success:
-            print(
-                f"Skipping section {section['num']} after {retry_count} retries",
-                file=sys.stderr,
+            logger.error(
+                "Skipping section %s after %d retries",
+                section["num"], retry_count,
             )
 
     if checkpoint_path:
