@@ -6,6 +6,8 @@ import os
 
 import click
 
+import dotenv
+
 
 def _config_from_env(env_path: str) -> dict:
     """Build an LLM config dict from a .env file."""
@@ -252,3 +254,178 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
     click.echo(result)
 
 
+@main.command(name="gazette-convert")
+@click.argument("gazette_pdf", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Output markup file path.",
+)
+@click.option(
+    "--llm-env",
+    "llm_env_file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to .env file with LLM configuration.",
+)
+@click.option(
+    "--llm-inline",
+    type=str,
+    help='JSON string with LLM configuration.',
+)
+@click.option(
+    "--llm-json",
+    "llm_json_path",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a JSON file with LLM config.",
+)
+@click.option(
+    "--document-name",
+    default="Gazette Notification",
+    help="Document name for the gazette.",
+)
+@click.option(
+    "--use-vision/--no-vision",
+    default=True,
+    help="Use multimodal vision LLM (default) or text extraction.",
+)
+@click.option(
+    "--azure-vision-key",
+    type=str,
+    default=None,
+    help="Vision-LLM API key. Required with --use-vision. "
+         "Falls back to AZURE_VISION_KEY env var.",
+)
+@click.option(
+    "--azure-vision-endpoint",
+    type=str,
+    default=None,
+    help="Vision-LLM endpoint. Required with --use-vision. "
+         "Falls back to AZURE_VISION_ENDPOINT env var.",
+)
+@click.option(
+    "--azure-vision-model",
+    type=str,
+    default=None,
+    help="Vision-LLM model/deployment name. Required with --use-vision. "
+         "Falls back to AZURE_VISION_MODEL env var.",
+)
+@click.option(
+    "--azure-vision-api-style",
+    type=str,
+    default=None,
+    help="Vision-LLM API style — one of 'chat', 'responses', 'azure-inference'. "
+         "Falls back to AZURE_VISION_API_STYLE env var.",
+)
+@click.option(
+    "--azure-vision-max-tokens",
+    type=int,
+    default=None,
+    help="Per-page output token budget for the vision-LLM. "
+         "Falls back to AZURE_VISION_MAX_TOKENS env var, then 16384.",
+)
+def gazette_convert(
+    gazette_pdf,
+    output_path,
+    llm_env_file,
+    llm_inline,
+    llm_json_path,
+    document_name,
+    use_vision,
+    azure_vision_key,
+    azure_vision_endpoint,
+    azure_vision_model,
+    azure_vision_api_style,
+    azure_vision_max_tokens,
+):
+    """Convert a Gazette PDF to legislative markup.
+
+    Uses multimodal vision LLM by default (--use-vision) to process each
+    page of the gazette. The vision model reads the page images and converts
+    them directly to Laws.Africa markup format.
+
+    Azure OpenAI vision model credentials can be provided via:
+    - Command line options (--azure-vision-*)
+    - .env file (--llm-env)
+    - Environment variables (AZURE_VISION_*)
+
+    Example:
+        akoma-markup gazette-convert gazette.pdf -o output.txt --llm-env .env
+    """
+    sources = [s for s in [llm_inline, llm_json_path, llm_env_file] if s]
+    if len(sources) == 0:
+        raise click.ClickException(
+            "Provide one of: --llm-inline, --llm-json, or --llm-env"
+        )
+    if len(sources) > 1:
+        raise click.ClickException(
+            "Use only one of: --llm-inline, --llm-json, or --llm-env"
+        )
+
+    # Parse LLM config
+    if llm_env_file:
+        config = _config_from_env(llm_env_file)
+        # Load env vars for vision credentials if not provided via CLI
+        dotenv.load_dotenv(llm_env_file)
+    elif llm_json_path:
+        with open(llm_json_path) as f:
+            config = json.load(f)
+    else:
+        try:
+            config = json.loads(llm_inline)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
+
+    # Resolve vision credentials from env if not provided via CLI
+    resolved_vision_key = azure_vision_key or os.environ.get("AZURE_VISION_KEY")
+    resolved_vision_endpoint = azure_vision_endpoint or os.environ.get(
+        "AZURE_VISION_ENDPOINT"
+    )
+    resolved_vision_model = azure_vision_model or os.environ.get(
+        "AZURE_VISION_MODEL"
+    )
+    resolved_vision_api_style = azure_vision_api_style or os.environ.get(
+        "AZURE_VISION_API_STYLE", "chat"
+    )
+    resolved_vision_max_tokens = azure_vision_max_tokens
+    if resolved_vision_max_tokens is None:
+        raw = os.environ.get("AZURE_VISION_MAX_TOKENS")
+        if raw:
+            try:
+                resolved_vision_max_tokens = int(raw)
+            except ValueError:
+                raise click.ClickException(
+                    f"AZURE_VISION_MAX_TOKENS must be an integer; got {raw!r}"
+                )
+
+    if use_vision:
+        if not resolved_vision_key:
+            raise click.ClickException(
+                "--use-vision requires --azure-vision-key or AZURE_VISION_KEY"
+            )
+        if not resolved_vision_endpoint:
+            raise click.ClickException(
+                "--use-vision requires --azure-vision-endpoint or AZURE_VISION_ENDPOINT"
+            )
+        if not resolved_vision_model:
+            raise click.ClickException(
+                "--use-vision requires --azure-vision-model or AZURE_VISION_MODEL"
+            )
+
+    from . import convert_gazette
+
+    result = convert_gazette(
+        gazette_pdf=gazette_pdf,
+        output_path=output_path,
+        llm_config=config if not llm_env_file else None,
+        document_name=document_name,
+        use_vision=use_vision,
+        azure_vision_key=resolved_vision_key,
+        azure_vision_endpoint=resolved_vision_endpoint,
+        azure_vision_model=resolved_vision_model,
+        azure_vision_api_style=resolved_vision_api_style,
+        azure_vision_max_tokens=resolved_vision_max_tokens,
+    )
+    click.echo(result)

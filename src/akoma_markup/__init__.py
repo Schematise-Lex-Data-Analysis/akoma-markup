@@ -1,7 +1,9 @@
 """akoma-markup: Convert legislative PDFs to Akoma Ntoso markup."""
 
+import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 
 from . import debug_dump
@@ -16,6 +18,12 @@ from .parsing.text.chapter_section_mapping import (
     parse_toc,
 )
 from .output import write_markup, write_metadata
+from .amendment.conversion import (
+    build_gazette_chain,
+    convert_gazette_text,
+    convert_gazette_pages_with_vision,
+    merge_gazette_pages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,3 +311,134 @@ def convert(
         logger.warning("%d sections failed conversion", len(errors))
 
     return markup_path
+
+
+def convert_gazette(
+    gazette_pdf: str | Path,
+    output_path: str,
+    *,
+    llm_config: dict | None = None,
+    llm_env_file: str | None = None,
+    llm_inline: str | None = None,
+    document_name: str = "Gazette Notification",
+    use_vision: bool = True,
+    azure_vision_key: str | None = None,
+    azure_vision_endpoint: str | None = None,
+    azure_vision_model: str | None = None,
+    azure_vision_api_style: str | None = "chat",
+    azure_vision_max_tokens: int | None = None,
+) -> str:
+    """Convert a gazette PDF to markup.
+
+    Args:
+        gazette_pdf: Path to gazette PDF file
+        output_path: Output markup file path
+        llm_config: LLM configuration dictionary
+        llm_env_file: Path to .env file with LLM configuration
+        llm_inline: JSON string with LLM configuration
+        document_name: Name for the gazette document
+        use_vision: If True, use multimodal vision LLM to process pages.
+            Otherwise, extract text and process with text-based LLM.
+        azure_vision_key: Azure OpenAI API key for vision model (if use_vision)
+        azure_vision_endpoint: Azure OpenAI endpoint (if use_vision)
+        azure_vision_model: Azure OpenAI model/deployment (if use_vision)
+        azure_vision_api_style: API style - 'chat', 'responses', or 'azure-inference'
+        azure_vision_max_tokens: Max tokens for vision model responses
+
+    Returns:
+        Path to the generated markup file.
+    """
+    pdf = Path(gazette_pdf)
+    if not pdf.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf}")
+
+    # Parse LLM config
+    if llm_config:
+        llm = build_llm(llm_config)
+    elif llm_env_file:
+        from dotenv import load_dotenv
+        load_dotenv(llm_env_file)
+        llm = build_llm({})
+    elif llm_inline:
+        llm = build_llm(json.loads(llm_inline))
+    else:
+        raise ValueError(
+            "Provide one of: llm_config, llm_env_file, or llm_inline"
+        )
+
+    if use_vision:
+        _log_step("Converting gazette using multimodal vision LLM")
+
+        # Initialize vision client
+        from .util.llm.vision import VisionClient
+
+        vision_client = VisionClient(
+            api_key=azure_vision_key,
+            endpoint=azure_vision_endpoint,
+            deployment=azure_vision_model,
+            api_mode=azure_vision_api_style,
+            extraction_max_tokens=azure_vision_max_tokens,
+        )
+
+        # Render all pages to images
+        _log_step("Rendering PDF pages to images")
+        from .util.pdf.images import render_pages, page_count
+
+        total_pages = page_count(pdf)
+        page_nums = list(range(1, total_pages + 1))
+        page_images = render_pages(pdf, page_nums, dpi=150)
+
+        logger.info("Rendered %d pages", len(page_images))
+
+        # Process pages with vision
+        checkpoint_dir = Path(output_path).parent / ".akoma_cache"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"{pdf.stem}_gazette_checkpoint.json"
+
+        page_markups = convert_gazette_pages_with_vision(
+            vision_client=vision_client,
+            page_images=page_images,
+            checkpoint_path=checkpoint_path,
+        )
+
+        # Merge page markups
+        _log_step("Merging page markups")
+        merged_markup = merge_gazette_pages(page_markups, llm=None)
+
+    else:
+        _log_step("Converting gazette using text extraction")
+
+        # Extract text from PDF
+        from .util.pdf.text import extract_pdf_pages
+
+        per_page_text = extract_pdf_pages(str(pdf))
+        gazette_text = "\n".join(per_page_text)
+
+        # Build chain and convert
+        chain = build_gazette_chain(llm, document_name=document_name)
+        merged_markup = convert_gazette_text(chain, gazette_text)
+
+    # Write output
+    _log_step(f"Writing output to {output_path}")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(merged_markup)
+
+    # Write metadata
+    metadata = {
+        "document_name": document_name,
+        "source_file": str(gazette_pdf),
+        "conversion_date": datetime.now().isoformat(),
+        "type": "gazette",
+        "use_vision": use_vision,
+    }
+    meta_path = Path(output_path).with_suffix(".meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Gazette conversion complete")
+    logger.info("Markup written to %s", output_path)
+    logger.info("Metadata written to %s", meta_path)
+
+    return str(output_path)
