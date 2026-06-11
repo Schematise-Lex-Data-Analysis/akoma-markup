@@ -145,14 +145,22 @@ def convert_gazette_page_with_vision(
         total_pages=total_pages,
         previous_context=previous_context if previous_context else "None",
     )
+    
+    # DEBUG: Show prompt
+    print(f"\n=== DEBUG: Prompt for page {page_num} ===")
+    print(f"Prompt length: {len(prompt)} chars")
+    print(f"Prompt preview (first 300 chars):\n{prompt[:300]}...")
+    print("=== END DEBUG ===\n")
 
     retry_count = 0
     while retry_count < cfg["max_retries"]:
         try:
+            # Use high token limit for text extraction (dense gazette pages)
             result = vision_client.ask(
                 image=page_image,
                 prompt=prompt,
                 detail="high",
+                max_tokens=8192,  # Increased from default 16 tokens
             )
             return result
 
@@ -238,6 +246,14 @@ def convert_gazette_pages_with_vision(
                 rate_config=cfg,
             )
             results[page_num] = markup
+            
+            # DEBUG: Show what we got from the vision model
+            print(f"\n=== DEBUG: Page {page_num} ===")
+            print(f"Markup length: {len(markup)} chars")
+            print(f"First 500 chars:\n{markup[:500]}")
+            if len(markup) > 500:
+                print(f"... (truncated, total {len(markup)} chars)")
+            print("=== END DEBUG ===\n")
 
             # Update context for next page (last 500 chars for continuity)
             previous_context = markup[-500:] if markup else ""

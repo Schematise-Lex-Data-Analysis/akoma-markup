@@ -3,11 +3,7 @@
 GAZETTE_CONVERSION_PROMPT_TEMPLATE = """You are converting a Gazette of India notification to Laws.Africa plaintext markup format.
 
 CONTEXT:
-This is an official Gazette notification from the Government of India, typically containing:
-- Rules, regulations, or amendments
-- Ministerial notifications under specific Acts
-- G.S.R. (Gazette Statutory Rules) numbers
-- Complete text of new or amended rules
+This is an official Gazette notification from the Government of India
 
 MARKUP RULES:
 1. Rule format: RULE [num]. - [title/heading]
@@ -26,7 +22,7 @@ MARKUP RULES:
     - If a placeholder token is the only content, output just that line at the right indent
 
 EXAMPLE OUTPUT:
-```
+
 RULE 3. - Definitions
   In these rules, unless the context otherwise requires,—
 
@@ -39,7 +35,7 @@ RULE 3. - Definitions
 
   SUBRULE (2)
     Words and expressions used herein and not defined...
-```
+
 
 Preserve the exact legal text. Do not paraphrase or summarize."""
 
@@ -52,14 +48,16 @@ Output ONLY the markup, no explanations:"""
 
 GAZETTE_PAGE_CONVERSION_PROMPT = """You are converting a page from a Gazette of India notification to Laws.Africa plaintext markup format.
 
+CRITICAL INSTRUCTIONS:
+1. Extract ALL readable text from the entire page image
+2. Convert legislative text to Laws.Africa markup format (RULE, SUBRULE, CLAUSE)
+3. DO NOT use backticks, code fences, or markdown formatting
+4. Output plain text with proper indentation (2 spaces per level)
+5. Include headers/footers as plain text at beginning/end
+
 CONTEXT:
 This is page {page_num} of {total_pages} from an official Gazette notification from the Government of India. You will see this page as an image. Extract all text and convert to markup format.
 
-The gazette typically contains:
-- Rules, regulations, or amendments
-- Ministerial notifications under specific Acts
-- G.S.R. (Gazette Statutory Rules) numbers
-- Complete text of new or amended rules
 
 MARKUP RULES:
 1. Rule format: RULE [num]. - [title/heading]
@@ -76,14 +74,8 @@ MARKUP RULES:
 PREVIOUS CONTEXT:
 {previous_context}
 
-IMPORTANT: Convert ALL text visible in the image, including:
-- Main content (rules, subrules, clauses)
-- Header information (Gazette numbers, dates, ministry names)
-- Footer information (page numbers, publication details)
-- Tables (as markdown tables or placeholders)
-
 EXAMPLE OUTPUT:
-```
+
 RULE 3. - Definitions
   In these rules, unless the context otherwise requires,—
 
@@ -96,7 +88,7 @@ RULE 3. - Definitions
 
   SUBRULE (2)
     Words and expressions used herein and not defined...
-```
+
 
 Preserve the exact legal text. Do not paraphrase or summarize.
 

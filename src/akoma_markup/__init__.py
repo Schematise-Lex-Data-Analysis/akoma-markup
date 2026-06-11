@@ -317,9 +317,7 @@ def convert_gazette(
     gazette_pdf: str | Path,
     output_path: str,
     *,
-    llm_config: dict | None = None,
-    llm_env_file: str | None = None,
-    llm_inline: str | None = None,
+    llm_config: dict,
     document_name: str = "Gazette Notification",
     use_vision: bool = True,
     azure_vision_key: str | None = None,
@@ -333,9 +331,8 @@ def convert_gazette(
     Args:
         gazette_pdf: Path to gazette PDF file
         output_path: Output markup file path
-        llm_config: LLM configuration dictionary
-        llm_env_file: Path to .env file with LLM configuration
-        llm_inline: JSON string with LLM configuration
+        llm_config: LLM configuration dictionary. Must include 'provider' key.
+            Example: {"provider": "azure", "model": "gpt-4o"}
         document_name: Name for the gazette document
         use_vision: If True, use multimodal vision LLM to process pages.
             Otherwise, extract text and process with text-based LLM.
@@ -352,19 +349,8 @@ def convert_gazette(
     if not pdf.exists():
         raise FileNotFoundError(f"PDF not found: {pdf}")
 
-    # Parse LLM config
-    if llm_config:
-        llm = build_llm(llm_config)
-    elif llm_env_file:
-        from dotenv import load_dotenv
-        load_dotenv(llm_env_file)
-        llm = build_llm({})
-    elif llm_inline:
-        llm = build_llm(json.loads(llm_inline))
-    else:
-        raise ValueError(
-            "Provide one of: llm_config, llm_env_file, or llm_inline"
-        )
+    # Build LLM from config
+    llm = build_llm(llm_config)
 
     if use_vision:
         _log_step("Converting gazette using multimodal vision LLM")
@@ -386,7 +372,8 @@ def convert_gazette(
 
         total_pages = page_count(pdf)
         page_nums = list(range(1, total_pages + 1))
-        page_images = render_pages(pdf, page_nums, dpi=150)
+        # Increase DPI for better text extraction - vision models need clear text
+        page_images = render_pages(pdf, page_nums, dpi=300)
 
         logger.info("Rendered %d pages", len(page_images))
 
@@ -442,3 +429,115 @@ def convert_gazette(
     logger.info("Metadata written to %s", meta_path)
 
     return str(output_path)
+
+
+def convert_gazette_from_tsv(
+    tsv_path: str | Path,
+    output_path: str | Path,
+    *,
+    llm_config: dict,
+    document_name: str | None = None,
+) -> str:
+    """Convert a Gazette TSV (from gazette-extract) to markup.
+
+    This is Phase 3 of the Gazette pipeline: Takes the TSV output from
+    gazette-extract and uses LLM to convert each section to Akoma Ntoso
+    markup.
+
+    Args:
+        tsv_path: Path to the TSV file from gazette-extract
+        output_path: Output markup file path
+        llm_config: LLM configuration dictionary. Must include 'provider' key.
+            Example: {"provider": "azure", "model": "gpt-4o"}
+        document_name: Name for the document (defaults to TSV stem)
+
+    Returns:
+        Path to the generated markup file.
+    """
+    import pandas as pd
+    from pathlib import Path
+    from .gazette.conversion import (
+        build_gazette_chain,
+        process_gazette_sections,
+        assemble_gazette_markup,
+    )
+
+    tsv = Path(tsv_path)
+    if not tsv.exists():
+        raise FileNotFoundError(f"TSV not found: {tsv}")
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load TSV
+    _log_step(f"Loading TSV: {tsv}")
+    tsv_df = pd.read_csv(tsv, sep="\t")
+    logger.info("Loaded %d sections", len(tsv_df))
+
+    # Determine document name
+    doc_name = document_name or tsv.stem.replace("_sections", "")
+
+    # Build LLM and chain
+    _log_step("Building LLM chain")
+    llm = build_llm(llm_config)
+    chain = build_gazette_chain(llm, doc_name)
+
+    # Prepare sections from DataFrame
+    sections = []
+    for _, row in tsv_df.iterrows():
+        sections.append({
+            "num": str(row["section_num"]),
+            "heading": str(row["heading"]) if pd.notna(row["heading"]) else "",
+            "content": str(row["content"]) if pd.notna(row["content"]) else "",
+            "hierarchy_level": int(row.get("hierarchy_level", 1))
+            if pd.notna(row.get("hierarchy_level")) else 1,
+            "parent_section": str(row["parent_section"])
+            if pd.notna(row.get("parent_section")) else "",
+            "page": int(row["page"]) if pd.notna(row["page"]) else 0,
+        })
+
+    # Setup checkpoint path
+    checkpoint_dir = output.parent / ".akoma_cache"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"{output.stem}_markup_checkpoint.json"
+
+    # Process all sections with LLM
+    _log_step("Converting sections to markup")
+    results, errors = process_gazette_sections(
+        chain=chain,
+        sections=sections,
+        checkpoint_path=checkpoint_path,
+    )
+
+    # Log errors
+    if errors:
+        logger.warning("%d sections failed conversion", len(errors))
+        for err in errors:
+            logger.warning("  Section %s: %s", err["num"], err["error"][:60])
+
+    # Assemble final markup (no table regions for now - from Phase 1 TSV)
+    table_regions = []
+    markup = assemble_gazette_markup(results, doc_name, table_regions)
+
+    # Write output
+    _log_step(f"Writing output to {output}")
+    output.write_text(markup, encoding="utf-8")
+
+    # Write metadata
+    metadata = {
+        "document_name": doc_name,
+        "source_tsv": str(tsv_path),
+        "conversion_date": datetime.now().isoformat(),
+        "type": "gazette",
+        "sections_converted": len(results),
+        "sections_failed": len(errors),
+    }
+    meta_path = output.with_suffix(".meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Gazette conversion complete")
+    logger.info("Markup written to %s", output)
+    logger.info("Metadata written to %s", meta_path)
+
+    return str(output)

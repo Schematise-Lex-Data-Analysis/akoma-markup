@@ -255,7 +255,7 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
 
 
 @main.command(name="gazette-convert")
-@click.argument("gazette_pdf", type=click.Path(exists=True, dir_okay=False))
+@click.argument("tsv_file", type=click.Path(exists=True, dir_okay=False))
 @click.option(
     "-o",
     "--output",
@@ -283,76 +283,25 @@ def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
 )
 @click.option(
     "--document-name",
-    default="Gazette Notification",
-    help="Document name for the gazette.",
-)
-@click.option(
-    "--use-vision/--no-vision",
-    default=True,
-    help="Use multimodal vision LLM (default) or text extraction.",
-)
-@click.option(
-    "--azure-vision-key",
-    type=str,
     default=None,
-    help="Vision-LLM API key. Required with --use-vision. "
-         "Falls back to AZURE_VISION_KEY env var.",
-)
-@click.option(
-    "--azure-vision-endpoint",
-    type=str,
-    default=None,
-    help="Vision-LLM endpoint. Required with --use-vision. "
-         "Falls back to AZURE_VISION_ENDPOINT env var.",
-)
-@click.option(
-    "--azure-vision-model",
-    type=str,
-    default=None,
-    help="Vision-LLM model/deployment name. Required with --use-vision. "
-         "Falls back to AZURE_VISION_MODEL env var.",
-)
-@click.option(
-    "--azure-vision-api-style",
-    type=str,
-    default=None,
-    help="Vision-LLM API style — one of 'chat', 'responses', 'azure-inference'. "
-         "Falls back to AZURE_VISION_API_STYLE env var.",
-)
-@click.option(
-    "--azure-vision-max-tokens",
-    type=int,
-    default=None,
-    help="Per-page output token budget for the vision-LLM. "
-         "Falls back to AZURE_VISION_MAX_TOKENS env var, then 16384.",
+    help="Document name for the gazette (defaults to TSV stem).",
 )
 def gazette_convert(
-    gazette_pdf,
+    tsv_file,
     output_path,
     llm_env_file,
     llm_inline,
     llm_json_path,
     document_name,
-    use_vision,
-    azure_vision_key,
-    azure_vision_endpoint,
-    azure_vision_model,
-    azure_vision_api_style,
-    azure_vision_max_tokens,
 ):
-    """Convert a Gazette PDF to legislative markup.
+    """Convert a Gazette TSV to legislative markup (Phase 3).
 
-    Uses multimodal vision LLM by default (--use-vision) to process each
-    page of the gazette. The vision model reads the page images and converts
-    them directly to Laws.Africa markup format.
-
-    Azure OpenAI vision model credentials can be provided via:
-    - Command line options (--azure-vision-*)
-    - .env file (--llm-env)
-    - Environment variables (AZURE_VISION_*)
+    Takes the TSV output from gazette-extract and converts each section
+    to Akoma Ntoso markup using LLM.
 
     Example:
-        akoma-markup gazette-convert gazette.pdf -o output.txt --llm-env .env
+        akoma-markup gazette-extract gazette.pdf -o ./output --llm-env .env
+        akoma-markup gazette-convert ./output/gazette_sections.tsv -o markup.txt --llm-env .env
     """
     sources = [s for s in [llm_inline, llm_json_path, llm_env_file] if s]
     if len(sources) == 0:
@@ -367,8 +316,6 @@ def gazette_convert(
     # Parse LLM config
     if llm_env_file:
         config = _config_from_env(llm_env_file)
-        # Load env vars for vision credentials if not provided via CLI
-        dotenv.load_dotenv(llm_env_file)
     elif llm_json_path:
         with open(llm_json_path) as f:
             config = json.load(f)
@@ -378,8 +325,166 @@ def gazette_convert(
         except json.JSONDecodeError as exc:
             raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
 
-    # Resolve vision credentials from env if not provided via CLI
-    resolved_vision_key = azure_vision_key or os.environ.get("AZURE_VISION_KEY")
+    from . import convert_gazette_from_tsv
+
+    result = convert_gazette_from_tsv(
+        tsv_path=tsv_file,
+        output_path=output_path,
+        llm_config=config,
+        document_name=document_name,
+    )
+    click.echo(result)
+
+
+@main.command(name="gazette-extract")
+@click.argument("gazette_pdf", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_dir",
+    required=True,
+    type=click.Path(file_okay=False, writable=True),
+    help="Output directory for TSV and intermediate files.",
+)
+@click.option(
+    "--llm-env",
+    "llm_env_file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to .env file with LLM configuration.",
+)
+@click.option(
+    "--llm-inline",
+    type=str,
+    help='JSON string with LLM configuration.',
+)
+@click.option(
+    "--llm-json",
+    "llm_json_path",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a JSON file with LLM config.",
+)
+@click.option(
+    "--table-mode",
+    type=click.Choice(["declared", "auto", "full"]),
+    default=None,
+    help="Enable table rescue mode.",
+)
+@click.option(
+    "--table-pages",
+    type=str,
+    default=None,
+    help='Comma/range page list for table rescue, e.g. "10,12-15". '
+         'Required with --table-mode=declared.',
+)
+@click.option(
+    "--azure-vision-key",
+    type=str,
+    default=None,
+    help="Vision-LLM API key. Falls back to AZURE_VISION_KEY env var.",
+)
+@click.option(
+    "--azure-vision-endpoint",
+    type=str,
+    default=None,
+    help="Vision-LLM endpoint. Falls back to AZURE_VISION_ENDPOINT env var.",
+)
+@click.option(
+    "--azure-vision-model",
+    type=str,
+    default=None,
+    help="Vision-LLM model/deployment name. "
+         "Falls back to AZURE_VISION_MODEL env var.",
+)
+@click.option(
+    "--azure-vision-api-style",
+    type=str,
+    default=None,
+    help="Vision-LLM API style - 'chat', 'responses', or 'azure-inference'. "
+         "Falls back to AZURE_VISION_API_STYLE env var.",
+)
+@click.option(
+    "--azure-vision-max-tokens",
+    type=int,
+    default=None,
+    help="Per-page output token budget for the vision-LLM. "
+         "Falls back to AZURE_VISION_MAX_TOKENS env var, then 16384.",
+)
+@click.option(
+    "--skip-extraction",
+    is_flag=True,
+    help="Skip extraction and reuse existing TSV from cache.",
+)
+@click.option(
+    "--dpi",
+    type=int,
+    default=200,
+    help="DPI for rendering PDF pages to images (default: 200).",
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    default=4,
+    help="Number of parallel workers for page analysis (default: 4).",
+)
+def gazette_extract(
+    gazette_pdf,
+    output_dir,
+    llm_env_file,
+    llm_inline,
+    llm_json_path,
+    table_mode,
+    table_pages,
+    azure_vision_key,
+    azure_vision_endpoint,
+    azure_vision_model,
+    azure_vision_api_style,
+    azure_vision_max_tokens,
+    skip_extraction,
+    dpi,
+    max_workers,
+):
+    """Extract sections from a Gazette PDF using AI-powered analysis.
+
+    Phase 1 of the Gazette conversion pipeline: Uses multimodal vision LLM
+    to intelligently identify document structure, extract sections with
+    hierarchies, filter non-English content, and optionally rescue tables.
+
+    Outputs a TSV file compatible with akoma-markup's standard format, plus
+    intermediate JSON cache for resumable processing.
+
+    Example:
+        akoma-markup gazette-extract gazette.pdf -o ./output --llm-env .env
+
+        akoma-markup gazette-extract gazette.pdf -o ./output --llm-env .env \\
+            --table-mode auto
+    """
+    sources = [s for s in [llm_inline, llm_json_path, llm_env_file] if s]
+    if len(sources) == 0:
+        raise click.ClickException(
+            "Provide one of: --llm-inline, --llm-json, or --llm-env"
+        )
+    if len(sources) > 1:
+        raise click.ClickException(
+            "Use only one of: --llm-inline, --llm-json, or --llm-env"
+        )
+
+    # Parse LLM config (needed for table conversion later)
+    if llm_env_file:
+        dotenv.load_dotenv(llm_env_file)
+        config = _config_from_env(llm_env_file)
+    elif llm_json_path:
+        with open(llm_json_path) as f:
+            config = json.load(f)
+    else:
+        try:
+            config = json.loads(llm_inline)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
+
+    # Resolve vision credentials
+    resolved_vision_key = azure_vision_key or os.environ.get(
+        "AZURE_VISION_KEY"
+    )
     resolved_vision_endpoint = azure_vision_endpoint or os.environ.get(
         "AZURE_VISION_ENDPOINT"
     )
@@ -400,32 +505,71 @@ def gazette_convert(
                     f"AZURE_VISION_MAX_TOKENS must be an integer; got {raw!r}"
                 )
 
-    if use_vision:
-        if not resolved_vision_key:
-            raise click.ClickException(
-                "--use-vision requires --azure-vision-key or AZURE_VISION_KEY"
-            )
-        if not resolved_vision_endpoint:
-            raise click.ClickException(
-                "--use-vision requires --azure-vision-endpoint or AZURE_VISION_ENDPOINT"
-            )
-        if not resolved_vision_model:
-            raise click.ClickException(
-                "--use-vision requires --azure-vision-model or AZURE_VISION_MODEL"
-            )
+    if not resolved_vision_key:
+        raise click.ClickException(
+            "Vision LLM key required. Provide --azure-vision-key or "
+            "set AZURE_VISION_KEY env var."
+        )
+    if not resolved_vision_endpoint:
+        raise click.ClickException(
+            "Vision LLM endpoint required. Provide --azure-vision-endpoint or "
+            "set AZURE_VISION_ENDPOINT env var."
+        )
+    if not resolved_vision_model:
+        raise click.ClickException(
+            "Vision LLM model required. Provide --azure-vision-model or "
+            "set AZURE_VISION_MODEL env var."
+        )
 
-    from . import convert_gazette
+    # Parse table pages if declared mode
+    parsed_table_pages = None
+    if table_mode == "declared":
+        if not table_pages:
+            raise click.ClickException(
+                "--table-mode=declared requires --table-pages"
+            )
+        from .parsing.tables.rescue import parse_page_spec
 
-    result = convert_gazette(
-        gazette_pdf=gazette_pdf,
-        output_path=output_path,
-        llm_config=config if not llm_env_file else None,
-        document_name=document_name,
-        use_vision=use_vision,
-        azure_vision_key=resolved_vision_key,
-        azure_vision_endpoint=resolved_vision_endpoint,
-        azure_vision_model=resolved_vision_model,
-        azure_vision_api_style=resolved_vision_api_style,
-        azure_vision_max_tokens=resolved_vision_max_tokens,
+        try:
+            parsed_table_pages = parse_page_spec(table_pages)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --table-pages: {exc}")
+
+    # Initialize vision client
+    from .util.llm.vision import VisionClient
+
+    vision_client = VisionClient(
+        api_key=resolved_vision_key,
+        endpoint=resolved_vision_endpoint,
+        deployment=resolved_vision_model,
+        api_mode=resolved_vision_api_style,
+        extraction_max_tokens=resolved_vision_max_tokens,
     )
-    click.echo(result)
+
+    # Run extraction
+    from .gazette import extract_sections_with_ai
+    from pathlib import Path
+
+    pdf_path = Path(gazette_pdf)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if skip_extraction:
+        click.echo(f"Skipping extraction (using cache): {output_path}")
+
+    tsv_df = extract_sections_with_ai(
+        pdf_path=pdf_path,
+        vision_client=vision_client,
+        output_dir=output_path,
+        max_workers=max_workers,
+        dpi=dpi,
+    )
+
+    # Save TSV
+    tsv_path = output_path / f"{pdf_path.stem}_sections.tsv"
+    tsv_df.to_csv(tsv_path, sep="\t", index=False)
+
+    click.echo(f"Extraction complete!")
+    click.echo(f"  TSV: {tsv_path}")
+    click.echo(f"  Sections: {len(tsv_df)}")
+    click.echo(f"  Cache: {output_path / '.akoma_cache'}")
