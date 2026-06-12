@@ -129,9 +129,15 @@ def _build_section_tree(tsv_df: pd.DataFrame) -> dict:
         section_num = row.get("section_num")
         if pd.isna(section_num) or str(section_num).strip() == "":
             section_num = f"_row_{idx}"
+            section_key = section_num  # _row_{idx} is already unique
         else:
             section_num = str(section_num).strip()
-
+            # Create unique key for duplicate section numbers
+            section_key = section_num
+            if section_key in sections:
+                # Append index to make it unique
+                section_key = f"{section_num}_{idx}"
+        
         # Use heading/content directly from TSV columns
         heading = row.get("heading") if pd.notna(row.get("heading")) else ""
         content = row.get("content") if pd.notna(row.get("content")) else ""
@@ -139,8 +145,8 @@ def _build_section_tree(tsv_df: pd.DataFrame) -> dict:
         hierarchy = int(row.get("hierarchy_level", 1)) if pd.notna(row.get("hierarchy_level")) else 1
         page = int(row.get("page", 0)) if pd.notna(row.get("page")) else 0
 
-        sections[section_num] = {
-            "num": section_num,
+        sections[section_key] = {
+            "num": section_num,  # Original section number (not unique)
             "heading": str(heading),
             "content": str(content),
             "page": page,
@@ -148,36 +154,103 @@ def _build_section_tree(tsv_df: pd.DataFrame) -> dict:
             "parent_section": str(parent),
             "children": [],
             "_original_index": idx,
+            "_key": section_key,  # Store the unique key
         }
-        section_order.append((idx, section_num))
+        section_order.append((idx, section_key))
 
     def _find_existing_parent(parent_num: str) -> str | None:
         """Find closest existing ancestor for a parent reference."""
         if not parent_num:
             return None
+        
+        # Direct match
         if parent_num in sections:
             return parent_num
+        
+        # Try to find a section with matching original section number
+        # First, check all sections for exact num match
+        for key, section in sections.items():
+            if key == "_section_order":
+                continue
+            if section["num"] == parent_num:
+                return key
+        
+        # Handle compound references like "10.(3)"
+        # This means "the (3) that is a child of 10."
+        # Check if parent_num contains a dot
+        if "." in parent_num:
+            # Try to parse as "PARENT.CHILD"
+            parts = parent_num.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_part, child_part = parts
+                # Find parent
+                parent_key = None
+                if parent_part in sections:
+                    parent_key = parent_part
+                else:
+                    # Try to find parent by num
+                    for key, section in sections.items():
+                        if key == "_section_order":
+                            continue
+                        if section["num"] == parent_part:
+                            parent_key = key
+                            break
+                
+                if parent_key:
+                    # Now find child of this parent with num == child_part
+                    parent_section = sections[parent_key]
+                    for child_key in parent_section.get("children", []):
+                        if child_key in sections and sections[child_key]["num"] == child_part:
+                            return child_key
+        
         # Try stripping trailing elements (e.g., "4(1)" -> "4.")
         for i in range(len(parent_num) - 1, 0, -1):
             prefix = parent_num[:i]
             if prefix in sections:
                 return prefix
+            # Also try matching by num
+            for key, section in sections.items():
+                if key == "_section_order":
+                    continue
+                if section["num"] == prefix:
+                    return key
+        
         # Try adding dot suffix (e.g., "4" -> "4.")
         if parent_num + "." in sections:
             return parent_num + "."
+        # Also check by num
+        for key, section in sections.items():
+            if key == "_section_order":
+                continue
+            if section["num"] == parent_num + ".":
+                return key
+        
         # Try stripping then adding dot (e.g., "4(1)" -> "4" -> "4.")
         for i in range(len(parent_num) - 1, 0, -1):
             prefix = parent_num[:i]
             if prefix + "." in sections:
                 return prefix + "."
+            # Check by num
+            for key, section in sections.items():
+                if key == "_section_order":
+                    continue
+                if section["num"] == prefix + ".":
+                    return key
+        
         return None
 
     # Build parent-child relationships
-    for section_num, section in sections.items():
+    # Process in TSV order to ensure parents are processed before children
+    sorted_keys = sorted(
+        [k for k in sections.keys() if k != "_section_order"],
+        key=lambda k: sections[k]["_original_index"]
+    )
+    for section_key in sorted_keys:
+        section = sections[section_key]
         parent_num = section["parent_section"]
         existing_parent = _find_existing_parent(parent_num)
         if existing_parent:
-            sections[existing_parent]["children"].append(section_num)
+            sections[existing_parent]["children"].append(section_key)
 
     # Sort children by their original index to maintain TSV order
     for section in sections.values():
