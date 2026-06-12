@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RATE_CONFIG = {
     "delay_between_requests": 5,
     "max_retries": 3,
-    "initial_backoff": 60,
+    "initial_backoff": 10,
 }
 
 RETRYABLE_KEYWORDS = [

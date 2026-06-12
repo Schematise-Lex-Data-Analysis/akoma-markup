@@ -573,3 +573,57 @@ def gazette_extract(
     click.echo(f"  TSV: {tsv_path}")
     click.echo(f"  Sections: {len(tsv_df)}")
     click.echo(f"  Cache: {output_path / '.akoma_cache'}")
+
+
+@main.command(name="gazette-refine")
+@click.argument("tsv_file", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Output TSV file path.",
+)
+@click.option(
+    "--token-limit",
+    type=int,
+    default=8000,
+    help="Maximum tokens per chunk (default: 8000).",
+)
+@click.option(
+    "--tokenizer",
+    type=click.Choice(["tiktoken", "approx"]),
+    default="approx",
+    help="Tokenizer method (default: approx).",
+)
+def gazette_refine(
+    tsv_file,
+    output_path,
+    token_limit,
+    tokenizer,
+):
+    """Group and split Gazette TSV sections hierarchically.
+
+    This command concatenates subsections under their parent main sections
+    and splits content only when token limits are crossed. Outputs a TSV
+    that can be processed by gazette-convert.
+
+    Example:
+        akoma-markup gazette-extract gazette.pdf -o ./output --llm-env .env
+        akoma-markup gazette-refine ./output/gazette_sections.tsv \\
+            -o refined_sections.tsv --token-limit 8000
+        akoma-markup gazette-convert refined_sections.tsv -o markup.txt \\
+            --llm-env .env
+    """
+    from .gazette.refine import refine_gazette_grouping
+
+    result = refine_gazette_grouping(
+        tsv_path=tsv_file,
+        output_path=output_path,
+        token_limit=token_limit,
+        tokenizer=tokenizer,
+    )
+    click.echo(f"Created: {result['metadata']['output_path']}")
+    click.echo(f"Groups: {result['metadata']['groups_created']}")
+    click.echo(f"Chunks: {result['metadata']['chunks_created']}")

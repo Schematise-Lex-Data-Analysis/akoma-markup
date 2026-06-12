@@ -86,7 +86,7 @@ DEFAULT_RATE_CONFIG = {
     "batch_size": 3,
     "batch_delay": 30,
     "max_retries": 3,
-    "initial_backoff": 60,
+    "initial_backoff": 10,
 }
 
 RETRYABLE_KEYWORDS = [
