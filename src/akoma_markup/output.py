@@ -42,6 +42,38 @@ def write_markup(sections: list[dict], output_path: str) -> str:
     return str(out)
 
 
+def write_versioned_metadata(
+    metadata: dict,
+    output_path: str,
+    version_type: str = "base",
+    version_label: str | None = None,
+) -> str:
+    """Write versioned metadata JSON for amended legislation.
+
+    Args:
+        metadata: Metadata dictionary.
+        output_path: Path to the markup file.
+        version_type: "base" or "amended".
+        version_label: Optional version label.
+
+    Returns:
+        The metadata file path.
+    """
+    meta_path = Path(output_path).with_suffix(".meta.json")
+    full_metadata = {
+        "conversion_date": datetime.now().isoformat(),
+        "version_type": version_type,
+        **metadata
+    }
+    if version_label:
+        full_metadata["version_label"] = version_label
+
+    with open(meta_path, "w") as f:
+        json.dump(full_metadata, f, indent=2)
+
+    return str(meta_path)
+
+
 def write_metadata(
     sections: list[dict],
     errors: list[dict],
@@ -83,3 +115,33 @@ def write_metadata(
         json.dump(metadata, f, indent=2)
 
     return str(meta_path)
+
+
+def generate_versioned_filename(
+    act_name: str,
+    version_type: str,
+    version_label: str | None = None,
+    timestamp: bool = True,
+) -> str:
+    """Generate a versioned filename for legislation markup.
+
+    Args:
+        act_name: Name of the act.
+        version_type: "base" or "amended".
+        version_label: Optional version label (e.g., "2008").
+        timestamp: Whether to include timestamp.
+
+    Returns:
+        Generated filename.
+    """
+    # Clean act name
+    safe_act = act_name.lower().replace(" ", "_")
+    safe_act = "".join(c for c in safe_act if c.isalnum() or c in "_")
+
+    parts = [safe_act, version_type]
+    if version_label:
+        parts.append(version_label)
+    if timestamp:
+        parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    return f"{'_'.join(parts)}.txt"

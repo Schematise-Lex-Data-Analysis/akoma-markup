@@ -627,3 +627,290 @@ def gazette_refine(
     click.echo(f"Created: {result['metadata']['output_path']}")
     click.echo(f"Groups: {result['metadata']['groups_created']}")
     click.echo(f"Chunks: {result['metadata']['chunks_created']}")
+
+
+@main.command()
+@click.argument("base_markup", type=click.Path(exists=True, dir_okay=False))
+@click.argument("amendments_csv", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Output amended markup file path.",
+)
+@click.option(
+    "--llm-env",
+    "llm_env_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to .env file with LLM configuration.",
+)
+@click.option(
+    "--llm-inline",
+    type=str,
+    default=None,
+    help='JSON string with LLM configuration.',
+)
+@click.option(
+    "--llm-json",
+    "llm_json_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a JSON file with LLM config.",
+)
+@click.option(
+    "--act-name",
+    type=str,
+    default=None,
+    help="Name of the act (defaults to base markup filename).",
+)
+@click.option(
+    "--base-version",
+    type=str,
+    default="original",
+    help="Base version identifier.",
+)
+def amend(
+    base_markup,
+    amendments_csv,
+    output_path,
+    llm_env_path,
+    llm_inline,
+    llm_json_path,
+    act_name,
+    base_version,
+):
+    """Apply amendments to base legislation markup.
+
+    Reads amendments from CSV and applies them to base markup using LLM.
+
+    CSV format (expected columns):
+        section,operation,new_text,effective_date,amendment_act
+
+    Operations: replace, insert, delete
+
+    Example:
+        akoma-markup amend it_act_2000.txt amendments.csv -o it_act_2008.txt --llm-env .env
+    """
+    sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
+    if len(sources) == 0:
+        raise click.ClickException("Provide one of: --llm-inline, --llm-json, or --llm-env")
+    if len(sources) > 1:
+        raise click.ClickException("Use only one of: --llm-inline, --llm-json, or --llm-env")
+
+    # Parse LLM config
+    if llm_env_path:
+        config = _config_from_env(llm_env_path)
+    elif llm_json_path:
+        with open(llm_json_path) as f:
+            config = json.load(f)
+    else:
+        try:
+            config = json.loads(llm_inline)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
+
+    # Parse amendments CSV
+    import pandas as pd
+    import csv
+    
+    try:
+        df = pd.read_csv(amendments_csv)
+        required = ["section", "operation", "new_text", "effective_date", "amendment_act"]
+        missing = set(required) - set(df.columns)
+        if missing:
+            raise click.ClickException(f"Missing columns in CSV: {sorted(missing)}")
+        
+        amendments = df.to_dict(orient="records")
+    except Exception as exc:
+        raise click.ClickException(f"Error parsing amendments CSV: {exc}")
+
+    # Set act name
+    if not act_name:
+        from pathlib import Path
+        act_name = Path(base_markup).stem
+
+    # Call amend function
+    from . import amend as amend_func
+    
+    try:
+        output_file, errors = amend_func(
+            base_markup=base_markup,
+            amendments=amendments,
+            llm_config=config,
+            output_path=output_path,
+            act_name=act_name,
+            base_version=base_version,
+        )
+        
+        click.echo(f"Applied {len(amendments) - len(errors)} amendments")
+        click.echo(f"Amended markup written to: {output_file}")
+        
+        if errors:
+            click.echo(f"\nErrors ({len(errors)}):")
+            for err in errors[:5]:  # Show first 5 errors
+                click.echo(f"  Section {err['section']}: {err['error'][:60]}...")
+            if len(errors) > 5:
+                click.echo(f"  ... and {len(errors) - 5} more")
+    except Exception as exc:
+        raise click.ClickException(f"Amendment failed: {exc}")
+
+
+@main.command(name="batch-amend")
+@click.argument("registry_csv", type=click.Path(exists=True, dir_okay=False))
+@click.argument("gazette_folder", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_dir",
+    required=True,
+    type=click.Path(file_okay=False, writable=True),
+    help="Output directory for amended versions.",
+)
+@click.option(
+    "--llm-env",
+    "llm_env_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to .env file with LLM configuration.",
+)
+@click.option(
+    "--llm-inline",
+    type=str,
+    default=None,
+    help='JSON string with LLM configuration.',
+)
+@click.option(
+    "--llm-json",
+    "llm_json_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a JSON file with LLM config.",
+)
+def batch_amend(
+    registry_csv,
+    gazette_folder,
+    output_dir,
+    llm_env_path,
+    llm_inline,
+    llm_json_path,
+):
+    """Batch process amendments from registry CSV.
+
+    Processes all amendments in registry, applying them to base acts
+    and saving versioned outputs.
+
+    Example:
+        akoma-markup batch-amend amendments.csv gazettes/ -o versions/ --llm-env .env
+    """
+    sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
+    if len(sources) == 0:
+        raise click.ClickException("Provide one of: --llm-inline, --llm-json, or --llm-env")
+    if len(sources) > 1:
+        raise click.ClickException("Use only one of: --llm-inline, --llm-json, or --llm-env")
+
+    # Parse LLM config
+    if llm_env_path:
+        config = _config_from_env(llm_env_path)
+    elif llm_json_path:
+        with open(llm_json_path) as f:
+            config = json.load(f)
+    else:
+        try:
+            config = json.loads(llm_inline)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid JSON in --llm-inline: {exc}")
+
+    # Call batch_amend function
+    from . import batch_amend as batch_amend_func
+    
+    try:
+        results = batch_amend_func(
+            registry_csv=registry_csv,
+            gazette_folder=gazette_folder,
+            llm_config=config,
+            output_dir=output_dir,
+        )
+        
+        click.echo(f"Processed {len(results)} acts:")
+        for act_name, paths in results.items():
+            click.echo(f"  {act_name}:")
+            for path in paths:
+                click.echo(f"    - {path}")
+    except Exception as exc:
+        raise click.ClickException(f"Batch amendment failed: {exc}")
+
+
+@main.command()
+@click.argument("markup1", type=click.Path(exists=True, dir_okay=False))
+@click.argument("markup2", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, writable=True),
+    help="Output file for diff report (optional).",
+)
+@click.option(
+    "--context-lines",
+    type=int,
+    default=3,
+    help="Number of context lines in diff (default: 3).",
+)
+@click.option(
+    "--format",
+    "format_type",
+    type=click.Choice(["text", "section", "summary"]),
+    default="summary",
+    help="Diff format: text (unified), section (structured), summary (report).",
+)
+def diff(
+    markup1,
+    markup2,
+    output_path,
+    context_lines,
+    format_type,
+):
+    """Generate diff between two legislation versions.
+
+    Compares two markup files and shows differences.
+
+    Example:
+        akoma-markup diff it_act_2000.txt it_act_2008.txt --format summary
+    """
+    from pathlib import Path
+    from .amendment import (
+        generate_text_diff,
+        generate_section_diff,
+        generate_summary_report,
+    )
+    
+    # Read files
+    try:
+        with open(markup1, "r", encoding="utf-8") as f:
+            content1 = f.read()
+        with open(markup2, "r", encoding="utf-8") as f:
+            content2 = f.read()
+    except Exception as exc:
+        raise click.ClickException(f"Error reading files: {exc}")
+
+    # Generate diff
+    if format_type == "text":
+        result = generate_text_diff(content1, content2, context_lines)
+    elif format_type == "section":
+        result = generate_section_diff(content1, content2)
+        # Pretty print dict
+        import json
+        result = json.dumps(result, indent=2)
+    elif format_type == "summary":
+        section_diff = generate_section_diff(content1, content2)
+        result = generate_summary_report(section_diff)
+
+    # Output
+    if output_path:
+        Path(output_path).write_text(result, encoding="utf-8")
+        click.echo(f"Diff written to: {output_path}")
+    else:
+        click.echo(result)

@@ -541,3 +541,183 @@ def convert_gazette_from_tsv(
     logger.info("Metadata written to %s", meta_path)
 
     return str(output)
+
+
+def amend(
+    base_markup: str | Path,
+    amendments: list[dict],
+    llm_config: dict,
+    output_path: str | Path,
+    act_name: str = "Amended Act",
+    base_version: str = "original",
+    rate_config: dict | None = None,
+) -> tuple[str, list[dict]]:
+    """Apply amendments to base legislation markup.
+
+    Args:
+        base_markup: Path to base markup file or markup string.
+        amendments: List of amendment dicts with keys:
+            - section: str
+            - operation: "replace" | "insert" | "delete"
+            - new_text: str (for replace/insert)
+            - amendment_act: str
+            - effective_date: str
+        llm_config: LLM configuration dict.
+        output_path: Path to save amended markup.
+        act_name: Name of the act (for versioning).
+        base_version: Base version identifier.
+        rate_config: Rate limiting configuration.
+
+    Returns:
+        Tuple of (path_to_amended_markup, errors).
+    """
+    from pathlib import Path
+    from .amendment import apply_multiple_amendments
+    from .util.llm.factory import build_llm
+
+    # Load base markup
+    if isinstance(base_markup, Path):
+        base_path = base_markup
+        base_content = base_path.read_text(encoding="utf-8")
+    elif isinstance(base_markup, str) and Path(base_markup).exists():
+        base_path = Path(base_markup)
+        base_content = base_path.read_text(encoding="utf-8")
+    else:
+        base_content = base_markup
+        base_path = None
+
+    # Build LLM
+    llm = build_llm(llm_config)
+
+    # Apply amendments
+    amended_markup, errors = apply_multiple_amendments(
+        llm=llm,
+        base_markup=base_content,
+        amendments=amendments,
+        rate_config=rate_config,
+    )
+
+    # Save output
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(amended_markup, encoding="utf-8")
+
+    # Generate metadata
+    metadata = {
+        "act_name": act_name,
+        "base_version": base_version,
+        "amendments_applied": len(amendments) - len(errors),
+        "amendments_failed": len(errors),
+        "generated_at": datetime.now().isoformat(),
+        "source_base": str(base_path) if base_path else "string_input",
+    }
+
+    meta_path = output_path.with_suffix(".meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Applied %d amendments (%d failed)", len(amendments) - len(errors), len(errors))
+    logger.info("Amended markup written to %s", output_path)
+
+    return str(output_path), errors
+
+
+def batch_amend(
+    registry_csv: str | Path,
+    gazette_folder: str | Path,
+    llm_config: dict,
+    output_dir: str | Path,
+    rate_config: dict | None = None,
+) -> dict[str, list[str]]:
+    """Batch process amendments from registry CSV.
+
+    Processes all amendments in registry, loading base acts from
+    gazette folder, applying amendments, and saving versioned outputs.
+
+    Args:
+        registry_csv: Path to amendment registry CSV.
+        gazette_folder: Folder containing base act markup files.
+        llm_config: LLM configuration dict.
+        output_dir: Directory to save versioned outputs.
+        rate_config: Rate limiting configuration.
+
+    Returns:
+        Dictionary mapping act_name -> list of output file paths.
+    """
+    from pathlib import Path
+    from .amendment import (
+        parse_csv_registry,
+        validate_amendment_records,
+        group_amendments_by_act,
+    )
+    from .util.llm.factory import build_llm
+
+    # Parse registry
+    records = parse_csv_registry(registry_csv)
+
+    # Validate
+    issues = validate_amendment_records(records, gazette_folder)
+    if any(issues.values()):
+        logger.warning("Registry validation issues:")
+        for category, messages in issues.items():
+            if messages:
+                logger.warning("  %s: %s", category, messages[:3])
+
+    # Group by act
+    acts = group_amendments_by_act(records)
+
+    # Build LLM once for all amendments
+    llm = build_llm(llm_config)
+
+    results: dict[str, list[str]] = {}
+
+    for act_name, act_records in acts.items():
+        logger.info("Processing %s (%d amendments)", act_name, len(act_records))
+
+        # Find base markup file
+        base_file = None
+        gazette_folder_path = Path(gazette_folder)
+        for record in act_records:
+            if record.base_version:
+                base_file = gazette_folder_path / f"{act_name}_{record.base_version}_base.txt"
+                if base_file.exists():
+                    break
+                base_file = gazette_folder_path / f"{act_name}.txt"
+                if base_file.exists():
+                    break
+
+        if not base_file or not base_file.exists():
+            logger.warning("Base markup not found for %s, skipping", act_name)
+            continue
+
+        # Prepare amendments list
+        amendments = []
+        for record in act_records:
+            # Convert AmendmentRecord to amendment dict
+            for section in record.sections_amended:
+                amendments.append({
+                    "section": section,
+                    "operation": "replace",  # Default, can be customized
+                    "new_text": f"Amended by {record.amendment_act}",
+                    "amendment_act": record.amendment_act,
+                    "effective_date": record.effective_date or record.amendment_year,
+                })
+
+        # Apply amendments
+        output_name = f"{act_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_amended.txt"
+        output_path = Path(output_dir) / output_name
+
+        amended_path, errors = amend(
+            base_markup=base_file,
+            amendments=amendments,
+            llm_config=llm_config,
+            output_path=output_path,
+            act_name=act_name,
+            rate_config=rate_config,
+        )
+
+        if act_name not in results:
+            results[act_name] = []
+        results[act_name].append(amended_path)
+
+    return results
