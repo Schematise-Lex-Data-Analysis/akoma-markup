@@ -18,6 +18,24 @@ from .diff import (
     generate_summary_report,
     generate_text_diff,
 )
+from .extract import (
+    AmendmentExtractionResult,
+    extract_amendments_from_pdf,
+    extract_section_context,
+    generate_details_tsv,
+    generate_registry_csv,
+)
+from .footnote_linker import (
+    build_page_section_map,
+    extract_marker_from_annotation,
+    extract_markers_with_context,
+    link_footnotes_to_amendments,
+    validate_section_linkages,
+)
+from .patterns import (
+    ExtractedAmendment,
+    FootnoteContext,
+)
 from .registry import (
     AmendmentDetail,
     AmendmentRecord,
@@ -48,6 +66,20 @@ __all__ = [
     "convert_gazette_page_with_vision",
     "convert_gazette_pages_with_vision",
     "merge_gazette_pages",
+    # Amendment extraction from PDFs
+    "extract_amendments_from_pdf",
+    "extract_section_context",
+    "generate_registry_csv",
+    "generate_details_tsv",
+    # Footnote linking
+    "FootnoteContext",
+    "extract_markers_with_context",
+    "extract_marker_from_annotation",
+    "build_page_section_map",
+    "link_footnotes_to_amendments",
+    "validate_section_linkages",
+    "ExtractedAmendment",
+    "AmendmentExtractionResult",
     # Amendment registry
     "AmendmentRecord",
     "AmendmentDetail",

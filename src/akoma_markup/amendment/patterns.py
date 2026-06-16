@@ -8,6 +8,7 @@ IndiaCode legislative PDFs. The patterns cover common amendment operations:
 """
 
 import re
+from dataclasses import dataclass
 from typing import Pattern
 
 
@@ -98,6 +99,31 @@ CLAUSE_REF_PATTERN = re.compile(r"\(([a-z])\)")
 SUBCLAUSE_REF_PATTERN = re.compile(r"\(([i-v]+)\)")
 
 # ============================================================================
+# Footnote Marker Patterns
+# ============================================================================
+
+# Unicode superscripts: ¹, ², ³, ⁴-⁹
+UNICODE_SUPERSCRIPTS = "\u00B9\u00B2\u00B3\u2074\u2075\u2076\u2077\u2078\u2079"
+
+# Superscript footnote markers appearing inline with text
+FOOTNOTE_MARKER_PATTERN = re.compile(
+    rf"([^.!?\n]*[.!?])\s*(?:[{UNICODE_SUPERSCRIPTS}]|\[(\d+)\])(?=\s|$|\n)",
+    re.MULTILINE
+)
+
+# Extract marker number from annotation line (e.g., "¹ Subs. by..." or "[1] Subs...")
+FOOTNOTE_ANNOTATION_MARKER_PATTERN = re.compile(
+    rf"^\s*(?:([{UNICODE_SUPERSCRIPTS}])|\[(\d+)\]|(\d+))\s*[.\s]+",
+    re.UNICODE
+)
+
+# Marker with surrounding context (for section detection)
+MARKER_CONTEXT_PATTERN = re.compile(
+    rf".{{0,50}}(?:[{UNICODE_SUPERSCRIPTS}]|\[(\d+)\]).{{0,50}}",
+    re.DOTALL
+)
+
+# ============================================================================
 # Amendment Type Definitions
 # ============================================================================
 
@@ -147,6 +173,9 @@ class ExtractedAmendment:
         effective_date: str | None = None,
         original_text: str | None = None,
         ibid_reference: bool = False,
+        footnote_marker: str | None = None,
+        linkage_method: str = "",
+        linkage_confidence: str = "",
     ):
         self.amendment_type = amendment_type
         self.act_number = act_number
@@ -158,6 +187,9 @@ class ExtractedAmendment:
         self.effective_date = effective_date
         self.original_text = original_text
         self.ibid_reference = ibid_reference
+        self.footnote_marker = footnote_marker
+        self.linkage_method = linkage_method
+        self.linkage_confidence = linkage_confidence
 
     def to_dict(self) -> dict:
         """Convert to dictionary representation."""
@@ -172,6 +204,9 @@ class ExtractedAmendment:
             "effective_date": self.effective_date,
             "original_text": self.original_text,
             "ibid_reference": self.ibid_reference,
+            "footnote_marker": self.footnote_marker,
+            "linkage_method": self.linkage_method,
+            "linkage_confidence": self.linkage_confidence,
         }
 
     @property
@@ -184,8 +219,29 @@ class ExtractedAmendment:
     def __repr__(self) -> str:
         return (
             f"ExtractedAmendment(type={self.amendment_type}, "
-            f"act={self.amendment_act_id}, target={self.target_section})"
+            f"act={self.amendment_act_id}, target={self.target_section}, "
+            f"marker={self.footnote_marker})"
         )
+
+
+@dataclass
+class FootnoteContext:
+    """Links a footnote marker to its source context.
+
+    Attributes:
+        marker: The marker string (e.g., '¹' or '1')
+        marker_num: Numeric value of the marker (1-9)
+        surrounding_text: Text surrounding the marker
+        suspected_section: Section detected from context
+        page_num: Page where marker appears
+        line_num: Line number on page
+    """
+    marker: str
+    marker_num: int
+    surrounding_text: str
+    suspected_section: str | None
+    page_num: int
+    line_num: int
 
 
 # ============================================================================

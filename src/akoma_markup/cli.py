@@ -914,3 +914,321 @@ def diff(
         click.echo(f"Diff written to: {output_path}")
     else:
         click.echo(result)
+
+
+@main.command(name="extract-amendments")
+@click.argument("pdf_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o", "--output",
+    "output_path",
+    required=True,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Output file path (.csv, .tsv, or .json)",
+)
+@click.option(
+    "-f", "--format",
+    "output_format",
+    type=click.Choice(["csv", "tsv", "json", "auto"]),
+    default="auto",
+    help="Output format (default: auto-detect from extension)",
+)
+@click.option(
+    "--act-name",
+    type=str,
+    default=None,
+    help="Name of the act for report metadata",
+)
+@click.option(
+    "--base-version",
+    type=str,
+    default="base",
+    help="Base version identifier for metadata",
+)
+@click.option(
+    "--include-unlinked",
+    is_flag=True,
+    default=False,
+    help="Include amendments that couldn't be linked to sections",
+)
+@click.option(
+    "--min-confidence",
+    type=click.Choice(["high", "medium", "low", "none"]),
+    default="none",
+    help="Minimum linkage confidence to include",
+)
+@click.option(
+    "--validate-only",
+    is_flag=True,
+    default=False,
+    help="Only validate existing extraction without re-running",
+)
+@click.option(
+    "--report",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Generate detailed report file (markdown)",
+)
+@click.option(
+    "-v", "--verbose",
+    is_flag=True,
+    default=False,
+    help="Show detailed extraction progress",
+)
+def extract_amendments(
+    pdf_path,
+    output_path,
+    output_format,
+    act_name,
+    base_version,
+    include_unlinked,
+    min_confidence,
+    validate_only,
+    report,
+    verbose,
+):
+    """Extract amendment annotations from an IndiaCode PDF.
+
+    Uses footnote marker correlation to accurately link amendments to
+    their target sections. Outputs a structured file containing all
+    extracted amendment information.
+
+    Examples:
+        \b
+        # Extract to CSV (auto-detected from .csv extension)
+        akoma-markup extract-amendments act.pdf -o amendments.csv
+
+        # Extract to JSON with verbose output
+        akoma-markup extract-amendments act.pdf -o amendments.json -v
+
+        # Only high-confidence linked amendments
+        akoma-markup extract-amendments act.pdf -o amendments.tsv \\
+            --min-confidence high
+
+        # Include unlinked amendments in output
+        akoma-markup extract-amendments act.pdf -o all_amendments.csv \\
+            --include-unlinked
+
+        # Generate extraction report
+        akoma-markup extract-amendments act.pdf -o amendments.csv \\
+            --report extraction_report.md
+    """
+    from pathlib import Path
+    from datetime import datetime
+    from .amendment import (
+        extract_amendments_from_pdf,
+        generate_registry_csv,
+        generate_details_tsv,
+    )
+
+    pdf_path = Path(pdf_path)
+    output_path = Path(output_path)
+
+    # Set default act_name from PDF filename
+    if not act_name:
+        act_name = pdf_path.stem
+
+    # Auto-detect format from extension if needed
+    if output_format == "auto":
+        ext = output_path.suffix.lower()
+        if ext == ".csv":
+            output_format = "csv"
+        elif ext == ".tsv":
+            output_format = "tsv"
+        elif ext == ".json":
+            output_format = "json"
+        else:
+            raise click.ClickException(
+                f"Cannot auto-detect format from extension '{ext}'. "
+                "Use --format to specify explicitly."
+            )
+
+    if verbose:
+        click.echo(f"Extracting amendments from: {pdf_path}")
+        click.echo(f"Act name: {act_name}")
+        click.echo(f"Output format: {output_format}")
+
+    # Run extraction
+    try:
+        result = extract_amendments_from_pdf(pdf_path)
+    except Exception as exc:
+        raise click.ClickException(f"Extraction failed: {exc}")
+
+    amendments = result.amendments
+
+    # Filter by confidence level
+    confidence_order = {"high": 3, "medium": 2, "low": 1, "none": 0}
+    min_level = confidence_order.get(min_confidence, 0)
+
+    def get_confidence_level(amdt):
+        level = confidence_order.get(amdt.linkage_confidence or "none", 0)
+        return level
+
+    if min_confidence != "none":
+        amendments = [a for a in amendments if get_confidence_level(a) >= min_level]
+
+    # Filter unlinked amendments
+    if not include_unlinked:
+        amendments = [a for a in amendments if a.target_section]
+
+    if verbose:
+        click.echo(f"Total amendments found: {len(result.amendments)}")
+        click.echo(f"After filtering: {len(amendments)}")
+        click.echo(f"Sections found: {result.sections_found}")
+        linked = sum(1 for a in result.amendments if a.target_section)
+        click.echo(f"Linked amendments: {linked}")
+
+    # Generate output based on format
+    if output_format == "csv":
+        generate_registry_csv(amendments, output_path, act_name, base_version)
+    elif output_format == "tsv":
+        generate_details_tsv(amendments, output_path)
+    elif output_format == "json":
+        # Build JSON output with metadata
+        output_data = {
+            "pdf_path": str(pdf_path),
+            "extraction_date": datetime.now().isoformat(),
+            "act_name": act_name,
+            "base_version": base_version,
+            "statistics": {
+                "total_amendments": len(result.amendments),
+                "filtered_amendments": len(amendments),
+                "sections_found": result.sections_found,
+                "linked_amendments": sum(
+                    1 for a in result.amendments if a.target_section
+                ),
+                "errors": len(result.errors),
+            },
+            "amendments": [a.to_dict() for a in amendments],
+        }
+        import json
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+    click.echo(f"Extracted {len(amendments)} amendments to: {output_path}")
+
+    # Generate report if requested
+    if report:
+        report_path = Path(report)
+        _generate_extraction_report(
+            result, amendments, report_path, act_name, base_version
+        )
+        click.echo(f"Report written to: {report_path}")
+
+
+def _generate_extraction_report(
+    result, filtered_amendments, report_path, act_name, base_version
+):
+    """Generate markdown extraction report."""
+    from pathlib import Path
+    from datetime import datetime
+
+    all_amendments = result.amendments
+
+    # Calculate statistics
+    total = len(all_amendments)
+    filtered_count = len(filtered_amendments)
+    linked = sum(1 for a in all_amendments if a.target_section)
+    linkage_rate = (linked / total * 100) if total > 0 else 0
+
+    # Stats by type
+    by_type = {}
+    for a in all_amendments:
+        t = a.amendment_type or "unknown"
+        by_type[t] = by_type.get(t, 0) + 1
+
+    # Stats by confidence
+    by_confidence = {"high": 0, "medium": 0, "low": 0, "none": 0}
+    for a in all_amendments:
+        c = a.linkage_confidence or "none"
+        by_confidence[c] = by_confidence.get(c, 0) + 1
+
+    # Most amended sections
+    section_counts = {}
+    for a in all_amendments:
+        if a.target_section:
+            section_counts[a.target_section] = (
+                section_counts.get(a.target_section, 0) + 1
+            )
+    top_sections = sorted(section_counts.items(), key=lambda x: -x[1])[:10]
+
+    # Build report
+    lines = [
+        "# Amendment Extraction Report",
+        "",
+        "## Summary",
+        f"- **PDF**: {result.pdf_path.name}",
+        f"- **Act Name**: {act_name}",
+        f"- **Base Version**: {base_version}",
+        f"- **Extraction Date**: {datetime.now().isoformat()}",
+        f"- **Total Amendments**: {total}",
+        f"- **Filtered Amendments**: {filtered_count}",
+        f"- **Linked Amendments**: {linked}",
+        f"- **Linkage Rate**: {linkage_rate:.1f}% ({linked}/{total})",
+        "",
+        "## Amendments by Type",
+        "| Type | Count |",
+        "|------|-------|",
+    ]
+
+    for t, count in sorted(by_type.items()):
+        lines.append(f"| {t} | {count} |")
+
+    lines.extend([
+        "",
+        "## Linkage Confidence",
+        "| Confidence | Count | Percentage |",
+        "|------------|-------|------------|",
+    ])
+
+    for c in ["high", "medium", "low", "none"]:
+        count = by_confidence.get(c, 0)
+        pct = (count / total * 100) if total > 0 else 0
+        lines.append(f"| {c} | {count} | {pct:.1f}% |")
+
+    lines.extend([
+        "",
+        "## Most Amended Sections",
+        "| Section | Amendment Count |",
+        "|---------|-----------------|",
+    ])
+
+    if top_sections:
+        for section, count in top_sections:
+            lines.append(f"| {section} | {count} |")
+    else:
+        lines.append("| *(none)* | |")
+
+    # Unlinked amendments
+    unlinked = [a for a in all_amendments if not a.target_section]
+    lines.extend([
+        "",
+        "## Unlinked Amendments",
+    ])
+
+    if unlinked:
+        lines.append(f"*{len(unlinked)} amendment(s) without section linkage*")
+        for a in unlinked[:5]:
+            lines.append(f"- {a.amendment_type or 'unknown'}: {a.amendment_act_id}")
+        if len(unlinked) > 5:
+            lines.append(f"- ... and {len(unlinked) - 5} more")
+    else:
+        lines.append("*(none)*")
+
+    # Errors
+    lines.extend([
+        "",
+        "## Errors",
+    ])
+
+    if result.errors:
+        lines.append(f"*{len(result.errors)} error(s) encountered*")
+        for err in result.errors[:5]:
+            lines.append(f"- {err}")
+        if len(result.errors) > 5:
+            lines.append(f"- ... and {len(result.errors) - 5} more")
+    else:
+        lines.append("*(none)*")
+
+    lines.append("")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")

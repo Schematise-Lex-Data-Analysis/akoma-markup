@@ -13,6 +13,13 @@ from typing import Literal
 
 import pdfplumber
 
+from .footnote_linker import (
+    build_page_section_map,
+    extract_marker_from_annotation,
+    extract_markers_with_context,
+    link_footnotes_to_amendments,
+    validate_section_linkages,
+)
 from .patterns import (
     CLAUSE_OMITTED_PATTERN,
     ExtractedAmendment,
@@ -20,13 +27,10 @@ from .patterns import (
     INS_PATTERN,
     OMITTED_IBID_PATTERN,
     OMITTED_PATTERN,
-    SECTION_OMITTED_SHORTHAND,
     SUBS_IBID_PATTERN,
     SUBS_PATTERN,
     SUBS_SIMPLE_PATTERN,
-    detect_amendment_type,
 )
-from .registry import AmendmentDetail, AmendmentRecord
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +73,8 @@ def extract_amendments_from_pdf(
     """Extract amendment annotations from an IndiaCode PDF.
 
     Parses footnotes and annotations to identify amendments made to
-    the legislation over time.
+    the legislation over time. Uses footnote marker correlation to
+    accurately link amendments to their target sections.
 
     Args:
         pdf_path: Path to the PDF file
@@ -88,20 +93,68 @@ def extract_amendments_from_pdf(
 
     logger.info("Extracting amendments from %s", pdf_path)
 
+    # Import here to avoid circular dependency
+    from ..parsing.text.chapter_section_mapping import (
+        parse_toc,
+        preprocess_pdf_text,
+    )
+
+    # Pre-scan to get TOC sections
+    toc_sections: list[dict] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            all_text = ""
+            for page in pdf.pages[:10]:  # Usually in first 10 pages
+                all_text += page.extract_text() or ""
+            lines = preprocess_pdf_text(all_text).split("\n")
+            _, sections, _ = parse_toc(lines)
+            toc_sections = sections
+            sections_found = len(sections)
+    except Exception as exc:
+        logger.warning(f"Could not parse TOC: {exc}")
+
+    logger.info(f"Found {len(toc_sections)} sections in TOC")
+
+    # Build page-to-section map for fallback linking
+    page_section_map: dict[int, list[str]] = {}
+    try:
+        page_section_map = build_page_section_map(pdf_path, toc_sections)
+    except Exception as exc:
+        logger.warning(f"Could not build page section map: {exc}")
+
     try:
         with pdfplumber.open(pdf_path) as pdf:
             # Track last amending act for "ibid" references
             last_amending_act: dict[str, str] = {"number": "", "year": ""}
 
+            # Track current section across pages for proper inline context
+            current_section: str | None = None
+            
             for page_num, page in enumerate(pdf.pages, 1):
                 try:
                     text = page.extract_text() or ""
 
-                    # Extract amendments from this page
-                    page_amendments = _extract_from_page_text(
-                        text, page_num, last_amending_act
+                    # Step 1: Extract footnote markers with context
+                    markers = extract_markers_with_context(
+                        text, page_num, toc_sections
                     )
-                    amendments.extend(page_amendments)
+
+                    # Step 2: Extract amendment annotations from this page
+                    # Pass current_section to maintain cross-page tracking
+                    page_amendments, updated_section = _extract_from_page_text(
+                        text, page_num, last_amending_act, current_section
+                    )
+                    
+                    # Update current_section for next page
+                    if updated_section is not None:
+                        current_section = updated_section
+
+                    # Step 3: Link annotations to sections via footnote markers
+                    page_sections = page_section_map.get(page_num, [])
+                    linked_amendments = link_footnotes_to_amendments(
+                        markers, page_amendments, page_sections, toc_sections
+                    )
+                    amendments.extend(linked_amendments)
 
                     # Update last amending act if found
                     for amdt in page_amendments:
@@ -123,11 +176,21 @@ def extract_amendments_from_pdf(
         errors.append(error_msg)
         raise
 
+    # Validate section linkages and report statistics
+    amendments, linkage_warnings = validate_section_linkages(
+        amendments, toc_sections
+    )
+    errors.extend(linkage_warnings)
+
+    # Count linked vs unlinked
+    linked = sum(1 for a in amendments if a.target_section)
     logger.info(
-        "Extracted %d amendments from %s (%d sections found)",
+        "Extracted %d amendments from %s (%d sections found, "
+        "%d linked to sections)",
         len(amendments),
         pdf_path,
         sections_found,
+        linked,
     )
 
     return AmendmentExtractionResult(
@@ -142,6 +205,7 @@ def _extract_from_page_text(
     text: str,
     page_num: int,
     last_amending_act: dict[str, str],
+    current_section: str | None = None,
 ) -> list[ExtractedAmendment]:
     """Extract amendments from a single page's text.
 
@@ -149,15 +213,15 @@ def _extract_from_page_text(
         text: Page text content
         page_num: Page number for logging
         last_amending_act: Dict tracking the last amending act
+        current_section: Current section from previous page (for cross-page tracking)
 
     Returns:
-        List of extracted amendments from this page
+        Tuple of (amendments_list, updated_current_section)
     """
     amendments: list[ExtractedAmendment] = []
 
     # Look for common amendment patterns line by line
     lines = text.split("\n")
-    current_section: str | None = None
 
     for line in lines:
         line = line.strip()
@@ -165,9 +229,12 @@ def _extract_from_page_text(
             continue
 
         # Try to identify current section from line
+        # Only update if it looks like a real section header, not a footnote
         section_match = re.match(r"^(\d+[A-Z]?)\.\s+", line)
-        if section_match and not line.startswith(("1.", "2.", "3.", "4.")):
-            current_section = section_match.group(1)
+        if section_match:
+            # Check if this is likely a real section header vs a footnote annotation
+            if _is_likely_section_header(line, section_match.group(1)):
+                current_section = section_match.group(1)
 
         # Skip if this isn't a footnote/reference line
         if not _is_footnote_line(line):
@@ -180,7 +247,7 @@ def _extract_from_page_text(
         if amendment:
             amendments.append(amendment)
 
-    return amendments
+    return amendments, current_section
 
 
 def _is_footnote_line(line: str) -> bool:
@@ -216,6 +283,60 @@ def _is_footnote_line(line: str) -> bool:
     return False
 
 
+def _is_likely_section_header(line: str, section_num: str) -> bool:
+    """Check if a line that matches section pattern is likely a real section header.
+    
+    Distinguishes between real section headers (e.g., "1. Short title...") 
+    and footnote annotations that happen to start with numbers (e.g., "1. Subs. by...").
+    
+    Args:
+        line: The line to check
+        section_num: The section number matched by regex
+        
+    Returns:
+        True if likely a real section header, False if likely a footnote
+    """
+    line_lower = line.lower()
+    
+    # Footnote indicators that mean this is NOT a section header
+    footnote_indicators = [
+        "subs.",
+        "ins.",
+        "omitted",
+        "vide",
+        "notification",
+        "g.s.r.",
+        "gazette",
+        "w.e.f.",
+        "(w.e.f.",
+    ]
+    
+    # Check for footnote indicators
+    for indicator in footnote_indicators:
+        if indicator in line_lower:
+            return False
+    
+    # Real section headers often have certain patterns
+    # 1. May have em dash "–" after title
+    # 2. Usually don't have dates in parentheses (common in footnotes)
+    # 3. Section headers are usually title + optional em dash, not long text
+    
+    # Check if this looks like a date footnote (e.g., "1. 17th October, 2000...")
+    date_patterns = [
+        r"\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)",
+        r"\d{4},",
+        r"\d{1,2}-\d{1,2}-\d{4}",
+    ]
+    
+    for pattern in date_patterns:
+        if re.search(pattern, line_lower):
+            return False
+    
+    # If we get here, it's likely a real section header
+    return True
+
+
 def _match_amendment_pattern(
     line: str,
     current_section: str | None,
@@ -231,10 +352,13 @@ def _match_amendment_pattern(
     Returns:
         ExtractedAmendment if matched, None otherwise
     """
-    line = line.strip()
+    original_line = line.strip()
+
+    # Extract footnote marker (e.g., "¹ " or "[1] " or "1. ")
+    marker, _ = extract_marker_from_annotation(original_line)
 
     # Remove leading footnote numbers (e.g., "1. " or "1. Ins. by...")
-    line = re.sub(r"^\d+\.\s*", "", line)
+    line = re.sub(r"^\d+\.\s*", "", original_line)
 
     # Try substitution patterns
     match = SUBS_PATTERN.search(line) or SUBS_SIMPLE_PATTERN.search(line)
@@ -248,6 +372,7 @@ def _match_amendment_pattern(
             target_section=current_section,
             original_text=groups[-2] if len(groups) > 2 else None,
             effective_date=groups[-1] if len(groups) > 3 else None,
+            footnote_marker=marker,
         )
 
     # Try ibid substitution
@@ -263,6 +388,7 @@ def _match_amendment_pattern(
             original_text=groups[1] if len(groups) > 1 else None,
             effective_date=groups[2] if len(groups) > 2 else None,
             ibid_reference=True,
+            footnote_marker=marker,
         )
 
     # Try insertion patterns
@@ -276,6 +402,7 @@ def _match_amendment_pattern(
             section_number=groups[2],
             target_section=current_section,
             effective_date=groups[3] if len(groups) > 3 else None,
+            footnote_marker=marker,
         )
 
     # Try ibid insertion
@@ -290,6 +417,7 @@ def _match_amendment_pattern(
             target_section=current_section,
             effective_date=groups[1] if len(groups) > 1 else None,
             ibid_reference=True,
+            footnote_marker=marker,
         )
 
     # Try omission patterns
@@ -303,6 +431,7 @@ def _match_amendment_pattern(
             section_number=groups[2],
             target_section=current_section,
             effective_date=groups[3] if len(groups) > 3 else None,
+            footnote_marker=marker,
         )
 
     # Try ibid omission
@@ -317,6 +446,7 @@ def _match_amendment_pattern(
             target_section=current_section,
             effective_date=groups[1] if len(groups) > 1 else None,
             ibid_reference=True,
+            footnote_marker=marker,
         )
 
     # Try clause omission pattern
@@ -331,6 +461,7 @@ def _match_amendment_pattern(
             target_section=current_section,
             target_clause=groups[0],
             effective_date=groups[4] if len(groups) > 4 else None,
+            footnote_marker=marker,
         )
 
     return None
@@ -360,50 +491,46 @@ def generate_registry_csv(
     """
     output_path = Path(output_path)
 
-    # Group amendments by act
-    amendments_by_act: dict[tuple[str, str], list[ExtractedAmendment]] = {}
-    for amdt in amendments:
-        key = (amdt.act_number or "Unknown", amdt.act_year or "Unknown")
-        if key not in amendments_by_act:
-            amendments_by_act[key] = []
-        amendments_by_act[key].append(amdt)
-
-    # Write CSV
+    # Write CSV with per-amendment detail format
     fieldnames = [
-        "act_name",
-        "base_version",
-        "amendment_act",
-        "amendment_year",
-        "gazette_file",
-        "sections_amended",
+        "amendment_type",
+        "act_number",
+        "act_year",
+        "section_number",
+        "target_section",
+        "target_subsection",
+        "target_clause",
         "effective_date",
-        "notes",
+        "original_text",
+        "footnote_marker",
+        "linkage_method",
+        "linkage_confidence",
+        "ibid_reference",
     ]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for (act_num, act_year), act_amendments in amendments_by_act.items():
-            sections = sorted(
-                set(a.target_section for a in act_amendments if a.target_section)
-            )
-            effective_dates = sorted(
-                set(a.effective_date for a in act_amendments if a.effective_date)
-            )
-
+        for amdt in amendments:
             writer.writerow({
-                "act_name": act_name or "Unknown Act",
-                "base_version": base_version or "base",
-                "amendment_act": f"Act {act_num}",
-                "amendment_year": act_year,
-                "gazette_file": "",  # Would need additional lookup
-                "sections_amended": ",".join(sections) if sections else "",
-                "effective_date": effective_dates[0] if effective_dates else "",
-                "notes": f"{len(act_amendments)} amendment(s) found",
+                "amendment_type": amdt.amendment_type or "",
+                "act_number": amdt.act_number or "",
+                "act_year": amdt.act_year or "",
+                "section_number": amdt.section_number or "",
+                "target_section": amdt.target_section or "",
+                "target_subsection": amdt.target_subsection or "",
+                "target_clause": amdt.target_clause or "",
+                "effective_date": amdt.effective_date or "",
+                "original_text": amdt.original_text or "",
+                "footnote_marker": amdt.footnote_marker or "",
+                "linkage_method": amdt.linkage_method or "",
+                "linkage_confidence": amdt.linkage_confidence or "",
+                "ibid_reference": "TRUE" if amdt.ibid_reference else "FALSE",
             })
 
-    logger.info("Generated registry CSV: %s (%d acts)", output_path, len(amendments_by_act))
+    logger.info("Generated registry CSV: %s (%d amendments)",
+                output_path, len(amendments))
     return output_path
 
 
@@ -422,6 +549,13 @@ def generate_details_tsv(
     """
     output_path = Path(output_path)
 
+    # Map amendment type to operation
+    operation_map = {
+        "substitution": "replace",
+        "insertion": "insert",
+        "deletion": "delete",
+    }
+
     fieldnames = [
         "section",
         "operation",
@@ -431,6 +565,9 @@ def generate_details_tsv(
         "gazette_ref",
         "target_subsection",
         "target_clause",
+        "footnote_marker",
+        "linkage_method",
+        "linkage_confidence",
     ]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -438,25 +575,22 @@ def generate_details_tsv(
         writer.writeheader()
 
         for amdt in amendments:
-            # Map amendment type to operation
-            operation_map = {
-                "substitution": "replace",
-                "insertion": "insert",
-                "deletion": "delete",
-            }
-
             writer.writerow({
                 "section": amdt.target_section or "",
                 "operation": operation_map.get(amdt.amendment_type, "replace"),
-                "new_text": "",  # Would need full text extraction
+                "new_text": amdt.original_text or "",
                 "effective_date": amdt.effective_date or "",
                 "amendment_act": amdt.amendment_act_id,
                 "gazette_ref": "",
                 "target_subsection": amdt.target_subsection or "",
                 "target_clause": amdt.target_clause or "",
+                "footnote_marker": amdt.footnote_marker or "",
+                "linkage_method": amdt.linkage_method or "",
+                "linkage_confidence": amdt.linkage_confidence or "",
             })
 
-    logger.info("Generated details TSV: %s (%d amendments)", output_path, len(amendments))
+    logger.info("Generated details TSV: %s (%d amendments)",
+                output_path, len(amendments))
     return output_path
 
 
