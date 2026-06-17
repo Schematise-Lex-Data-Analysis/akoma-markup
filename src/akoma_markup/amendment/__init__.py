@@ -36,6 +36,32 @@ from .patterns import (
     ExtractedAmendment,
     FootnoteContext,
 )
+from .vision_schema import (
+    VisionExtractedAmendment,
+    AmendmentExtractionResult,
+)
+from .vision_extractor import (
+    VisionAmendmentExtractor,
+    ExtractionConfig,
+    extract_amendments_with_vision,
+)
+from .vision_cache import (
+    VisionExtractionCache,
+    get_default_cache,
+    clear_pdf_cache,
+    get_cache_stats,
+)
+from .hybrid_extractor import (
+    HybridAmendmentExtractor,
+    HybridExtractionConfig,
+    HybridExtractionResult,
+    extract_amendments_hybrid,
+)
+from .evaluation import (
+    ExtractionEvaluator,
+    EvaluationReport,
+    evaluate_extraction_methods,
+)
 from .registry import (
     AmendmentDetail,
     AmendmentRecord,
@@ -80,6 +106,26 @@ __all__ = [
     "validate_section_linkages",
     "ExtractedAmendment",
     "AmendmentExtractionResult",
+    # Vision-based amendment extraction
+    "VisionExtractedAmendment",
+    # Vision-based extraction
+    "VisionAmendmentExtractor",
+    "ExtractionConfig",
+    "extract_amendments_with_vision",
+    # Vision cache
+    "VisionExtractionCache",
+    "get_default_cache",
+    "clear_pdf_cache",
+    "get_cache_stats",
+    # Hybrid extraction
+    "HybridAmendmentExtractor",
+    "HybridExtractionConfig",
+    "HybridExtractionResult",
+    "extract_amendments_hybrid",
+    # Evaluation
+    "ExtractionEvaluator",
+    "EvaluationReport",
+    "evaluate_extraction_methods",
     # Amendment registry
     "AmendmentRecord",
     "AmendmentDetail",

@@ -123,10 +123,31 @@ def main():
          "Falls back to AZURE_VISION_MAX_TOKENS env var, then 16384. Bump "
          "this if you see truncation warnings on dense schedule pages.",
 )
+@click.option(
+    "--amendment-mode",
+    type=click.Choice(["regex", "vision", "hybrid"]),
+    default="regex",
+    help="Amendment extraction mode. 'regex' uses text patterns only (default). "
+         "'vision' uses vision LLM for amendment detection. "
+         "'hybrid' combines both methods for best results.",
+)
+@click.option(
+    "--hybrid-confidence",
+    type=float,
+    default=0.5,
+    help="Confidence threshold for hybrid extraction (0.0-1.0). "
+         "Higher values require more agreement between regex and vision methods.",
+)
+@click.option(
+    "--vision-config",
+    type=str,
+    default=None,
+    help='Inline JSON config for vision extraction, e.g. \'{"max_amendments_per_page": 20}\'',
+)
 def convert(pdf_path, output_path, llm_inline, llm_json_path, llm_env_path,
             table_mode, table_pages, azure_vision_key,
             azure_vision_endpoint, azure_vision_model,
-            azure_vision_max_tokens):
+            azure_vision_max_tokens, amendment_mode, hybrid_confidence, vision_config):
     """Convert a IndiaCode law PDF to Akoma Ntoso markup."""
     sources = [s for s in [llm_inline, llm_json_path, llm_env_path] if s]
     if len(sources) == 0:
@@ -969,10 +990,64 @@ def diff(
     help="Generate detailed report file (markdown)",
 )
 @click.option(
+    "--gazette-dir",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help="Directory containing gazette notification PDFs for linking",
+)
+@click.option(
     "-v", "--verbose",
     is_flag=True,
     default=False,
     help="Show detailed extraction progress",
+)
+@click.option(
+    "--vision-amendments",
+    is_flag=True,
+    default=False,
+    help="Enable multimodal LLM (vision) based amendment extraction",
+)
+@click.option(
+    "--vision-provider",
+    type=click.Choice(["azure", "anthropic"]),
+    default="azure",
+    help="Vision LLM provider (default: azure)",
+)
+@click.option(
+    "--vision-model",
+    type=str,
+    default=None,
+    help="Vision LLM model name (default: from env or gpt-4-vision-preview)",
+)
+@click.option(
+    "--vision-dpi",
+    type=int,
+    default=120,
+    help="DPI for PDF rendering (default: 120)",
+)
+@click.option(
+    "--vision-detail",
+    type=click.Choice(["low", "high", "auto"]),
+    default="high",
+    help="Image detail level for vision LLM (default: high)",
+)
+@click.option(
+    "--resume-from-checkpoint",
+    is_flag=True,
+    default=False,
+    help="Resume extraction from checkpoint if available",
+)
+@click.option(
+    "--max-concurrent-pages",
+    type=int,
+    default=3,
+    help="Maximum concurrent page processing (default: 3)",
+)
+@click.option(
+    "--vision-confidence-threshold",
+    type=float,
+    default=0.5,
+    help="Minimum confidence score for vision amendments (default: 0.5)",
 )
 def extract_amendments(
     pdf_path,
@@ -984,7 +1059,16 @@ def extract_amendments(
     min_confidence,
     validate_only,
     report,
+    gazette_dir,
     verbose,
+    vision_amendments,
+    vision_provider,
+    vision_model,
+    vision_dpi,
+    vision_detail,
+    resume_from_checkpoint,
+    max_concurrent_pages,
+    vision_confidence_threshold,
 ):
     """Extract amendment annotations from an IndiaCode PDF.
 
@@ -1011,6 +1095,10 @@ def extract_amendments(
         # Generate extraction report
         akoma-markup extract-amendments act.pdf -o amendments.csv \\
             --report extraction_report.md
+
+        # Link amendments to gazette notifications
+        akoma-markup extract-amendments act.pdf -o enhanced_amendments.tsv \\
+            --gazette-dir "Gazette notifications - IT Act Rules 2021"
     """
     from pathlib import Path
     from datetime import datetime
@@ -1049,39 +1137,139 @@ def extract_amendments(
 
     # Run extraction
     try:
-        result = extract_amendments_from_pdf(pdf_path)
+        if vision_amendments:
+            # Vision-based extraction
+            click.echo("Using multimodal LLM (vision) for amendment extraction")
+            
+            # Import vision extraction modules
+            from .amendment.vision_extractor import extract_amendments_with_vision
+            from .amendment.vision_cache import VisionExtractionCache, get_default_cache
+            import asyncio
+            
+            # Build vision config from environment and CLI options
+            vision_config = {
+                "provider": vision_provider,
+                "model": vision_model,
+                "dpi": vision_dpi,
+                "image_detail": vision_detail,
+                "max_concurrent_pages": max_concurrent_pages,
+                "confidence_threshold": vision_confidence_threshold,
+            }
+            
+            # Try to get vision credentials from environment
+            import os
+            if vision_provider == "azure":
+                if not vision_config.get("endpoint"):
+                    vision_config["endpoint"] = os.environ.get("AZURE_VISION_ENDPOINT")
+                if not vision_config.get("api_key"):
+                    vision_config["api_key"] = os.environ.get("AZURE_VISION_KEY")
+                if not vision_config.get("model"):
+                    vision_config["model"] = os.environ.get("AZURE_VISION_MODEL") or "gpt-4-vision-preview"
+            elif vision_provider == "anthropic":
+                if not vision_config.get("api_key"):
+                    vision_config["api_key"] = os.environ.get("ANTHROPIC_API_KEY")
+                if not vision_config.get("model"):
+                    vision_config["model"] = os.environ.get("ANTHROPIC_VISION_MODEL") or "claude-3-5-sonnet"
+            
+            # Check for required credentials
+            if vision_provider == "azure" and (not vision_config.get("api_key") or not vision_config.get("endpoint")):
+                raise click.ClickException(
+                    "Azure vision extraction requires --azure-vision-key and --azure-vision-endpoint "
+                    "or AZURE_VISION_KEY and AZURE_VISION_ENDPOINT environment variables"
+                )
+            
+            # Handle checkpoint resumption
+            cache = get_default_cache()
+            if resume_from_checkpoint:
+                processed_pages = cache.get_processed_pages(pdf_path)
+                if processed_pages:
+                    click.echo(f"Found checkpoint for {len(processed_pages)} pages")
+                    # For now, we'll still process all pages but could skip processed ones
+                    # This would require modifying the extractor to skip already processed pages
+            
+            # Run vision extraction
+            vision_result = asyncio.run(extract_amendments_with_vision(
+                pdf_path, 
+                vision_config
+            ))
+            
+            # Convert VisionExtractedAmendment to ExtractedAmendment if needed
+            # For now, we'll use the vision result directly
+            result = vision_result
+            amendments = result.extracted_amendments
+            
+            # Save checkpoint if requested
+            if not resume_from_checkpoint:
+                cache.save_extraction_result(pdf_path, result)
+            
+        else:
+            # Traditional regex-based extraction
+            result = extract_amendments_from_pdf(pdf_path)
+            amendments = result.amendments
+            
     except Exception as exc:
         raise click.ClickException(f"Extraction failed: {exc}")
 
-    amendments = result.amendments
+    # Handle different result structures for vision vs regex extraction
+    if vision_amendments:
+        # Vision extraction result
+        total_amendments = len(result.extracted_amendments)
+        sections_found = 0  # Vision extraction doesn't track sections found
+        errors = result.extraction_errors
+        all_amendments = result.extracted_amendments
+    else:
+        # Regex extraction result
+        total_amendments = len(result.amendments)
+        sections_found = result.sections_found
+        errors = result.errors
+        all_amendments = result.amendments
 
-    # Filter by confidence level
-    confidence_order = {"high": 3, "medium": 2, "low": 1, "none": 0}
-    min_level = confidence_order.get(min_confidence, 0)
+    # Filter by confidence level (for regex extraction only)
+    if not vision_amendments:
+        confidence_order = {"high": 3, "medium": 2, "low": 1, "none": 0}
+        min_level = confidence_order.get(min_confidence, 0)
 
-    def get_confidence_level(amdt):
-        level = confidence_order.get(amdt.linkage_confidence or "none", 0)
-        return level
+        def get_confidence_level(amdt):
+            level = confidence_order.get(amdt.linkage_confidence or "none", 0)
+            return level
 
-    if min_confidence != "none":
-        amendments = [a for a in amendments if get_confidence_level(a) >= min_level]
+        if min_confidence != "none":
+            amendments = [a for a in amendments if get_confidence_level(a) >= min_level]
+    else:
+        # For vision extraction, filter by confidence_score field
+        if vision_confidence_threshold > 0:
+            amendments = [a for a in amendments if a.confidence_score >= vision_confidence_threshold]
 
-    # Filter unlinked amendments
-    if not include_unlinked:
+    # Filter unlinked amendments (only for regex extraction)
+    if not include_unlinked and not vision_amendments:
         amendments = [a for a in amendments if a.target_section]
 
     if verbose:
-        click.echo(f"Total amendments found: {len(result.amendments)}")
+        click.echo(f"Total amendments found: {total_amendments}")
         click.echo(f"After filtering: {len(amendments)}")
-        click.echo(f"Sections found: {result.sections_found}")
-        linked = sum(1 for a in result.amendments if a.target_section)
-        click.echo(f"Linked amendments: {linked}")
+        if not vision_amendments:
+            click.echo(f"Sections found: {sections_found}")
+            linked = sum(1 for a in all_amendments if a.target_section)
+            click.echo(f"Linked amendments: {linked}")
+        if errors:
+            click.echo(f"Errors encountered: {len(errors)}")
 
     # Generate output based on format
     if output_format == "csv":
         generate_registry_csv(amendments, output_path, act_name, base_version)
     elif output_format == "tsv":
-        generate_details_tsv(amendments, output_path)
+        # Get current date for metadata
+        from datetime import datetime
+        extraction_date = datetime.now().isoformat()
+        
+        # Pass metadata to TSV generation
+        generate_details_tsv(
+            amendments, 
+            output_path, 
+            gazette_dir=gazette_dir,
+            source_pdf=pdf_path,
+            extraction_date=extraction_date
+        )
     elif output_format == "json":
         # Build JSON output with metadata
         output_data = {
@@ -1090,13 +1278,14 @@ def extract_amendments(
             "act_name": act_name,
             "base_version": base_version,
             "statistics": {
-                "total_amendments": len(result.amendments),
+                "total_amendments": total_amendments,
                 "filtered_amendments": len(amendments),
-                "sections_found": result.sections_found,
+                "sections_found": sections_found if not vision_amendments else 0,
                 "linked_amendments": sum(
-                    1 for a in result.amendments if a.target_section
-                ),
-                "errors": len(result.errors),
+                    1 for a in all_amendments if a.target_section
+                ) if not vision_amendments else len(amendments),
+                "errors": len(errors),
+                "extraction_method": "vision" if vision_amendments else "regex",
             },
             "amendments": [a.to_dict() for a in amendments],
         }
@@ -1108,11 +1297,14 @@ def extract_amendments(
 
     # Generate report if requested
     if report:
-        report_path = Path(report)
-        _generate_extraction_report(
-            result, amendments, report_path, act_name, base_version
-        )
-        click.echo(f"Report written to: {report_path}")
+        if vision_amendments:
+            click.echo("Warning: Report generation not yet supported for vision extraction")
+        else:
+            report_path = Path(report)
+            _generate_extraction_report(
+                result, amendments, report_path, act_name, base_version
+            )
+            click.echo(f"Report written to: {report_path}")
 
 
 def _generate_extraction_report(

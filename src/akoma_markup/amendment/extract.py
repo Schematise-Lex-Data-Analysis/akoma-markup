@@ -364,12 +364,30 @@ def _match_amendment_pattern(
     match = SUBS_PATTERN.search(line) or SUBS_SIMPLE_PATTERN.search(line)
     if match:
         groups = match.groups()
+        
+        # Extract target location from pattern groups
+        target_subsection = None
+        target_clause = None
+        
+        if len(groups) > 6:
+            # SUBS_PATTERN has 9 groups
+            # Group 4: sub-section, Group 5: sub-clause, Group 6: clause, Group 7: section
+            if groups[3]:  # sub-section
+                target_subsection = groups[3]
+            elif groups[4]:  # sub-clause
+                target_subsection = groups[4]  # Treat sub-clause as subsection
+            elif groups[5]:  # clause
+                target_clause = groups[5]
+            # Group 7 (section) is captured but we already have target_section from context
+        
         return ExtractedAmendment(
             amendment_type="substitution",
             act_number=groups[0] if len(groups) > 0 else None,
             act_year=groups[1] if len(groups) > 1 else None,
             section_number=groups[2] if len(groups) > 2 else None,
             target_section=current_section,
+            target_subsection=target_subsection,
+            target_clause=target_clause,
             original_text=groups[-2] if len(groups) > 2 else None,
             effective_date=groups[-1] if len(groups) > 3 else None,
             footnote_marker=marker,
@@ -537,17 +555,35 @@ def generate_registry_csv(
 def generate_details_tsv(
     amendments: list[ExtractedAmendment],
     output_path: str | Path,
+    gazette_dir: str | Path | None = None,
+    source_pdf: str | Path | None = None,
+    extraction_date: str | None = None,
 ) -> Path:
     """Generate amendment details TSV from extracted amendments.
 
     Args:
         amendments: List of extracted amendments
         output_path: Path to write TSV file
+        gazette_dir: Optional directory containing gazette notification PDFs
+            If provided, will attempt to link amendments to gazette references
+        source_pdf: Optional source PDF path for metadata
+        extraction_date: Optional extraction date for metadata
 
     Returns:
         Path to the written TSV file
     """
     output_path = Path(output_path)
+    
+    # Create gazette mapping if gazette_dir provided
+    gazette_mapping = {}
+    if gazette_dir:
+        try:
+            from .gazette_registry import link_amendments_to_gazettes
+            gazette_mapping = link_amendments_to_gazettes(amendments, Path(gazette_dir))
+        except ImportError as e:
+            logger.warning(f"Could not import gazette registry: {e}")
+        except Exception as e:
+            logger.warning(f"Error linking amendments to gazettes: {e}")
 
     # Map amendment type to operation
     operation_map = {
@@ -568,6 +604,11 @@ def generate_details_tsv(
         "footnote_marker",
         "linkage_method",
         "linkage_confidence",
+        # Metadata columns
+        "source_pdf",
+        "extraction_date",
+        "validation_status",
+        "data_quality_score",
     ]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -575,18 +616,70 @@ def generate_details_tsv(
         writer.writeheader()
 
         for amdt in amendments:
+            # Get gazette reference if available
+            gazette_ref = ""
+            if gazette_mapping and hasattr(amdt, 'amendment_act_id'):
+                gazette_ref = gazette_mapping.get(amdt.amendment_act_id, "")
+            
+            # Calculate data quality score (simple heuristic)
+            data_quality_score = 0.0
+            validation_status = "pending"
+            
+            # Basic validation checks
+            validation_issues = []
+            
+            # Check if amendment has required fields
+            if not amdt.target_section:
+                validation_issues.append("missing_target_section")
+            if not amdt.amendment_act_id:
+                validation_issues.append("missing_amendment_act")
+            if not amdt.footnote_marker:
+                validation_issues.append("missing_footnote_marker")
+            
+            # Calculate quality score based on available data
+            score_factors = 0
+            total_factors = 7  # Total factors we check
+            
+            if amdt.target_section:
+                score_factors += 1
+            if amdt.amendment_act_id:
+                score_factors += 1
+            if amdt.footnote_marker:
+                score_factors += 1
+            if amdt.effective_date:
+                score_factors += 1
+            if amdt.target_subsection or amdt.target_clause:
+                score_factors += 1  # Target location
+            if gazette_ref:
+                score_factors += 1  # Gazette reference
+            if amdt.linkage_confidence == "high":
+                score_factors += 1  # High confidence linkage
+            
+            data_quality_score = round(score_factors / total_factors, 2)
+            
+            # Set validation status
+            if not validation_issues:
+                validation_status = "valid"
+            else:
+                validation_status = f"issues: {','.join(validation_issues)}"
+            
             writer.writerow({
                 "section": amdt.target_section or "",
                 "operation": operation_map.get(amdt.amendment_type, "replace"),
                 "new_text": amdt.original_text or "",
                 "effective_date": amdt.effective_date or "",
                 "amendment_act": amdt.amendment_act_id,
-                "gazette_ref": "",
+                "gazette_ref": gazette_ref,
                 "target_subsection": amdt.target_subsection or "",
                 "target_clause": amdt.target_clause or "",
                 "footnote_marker": amdt.footnote_marker or "",
                 "linkage_method": amdt.linkage_method or "",
                 "linkage_confidence": amdt.linkage_confidence or "",
+                # Metadata columns
+                "source_pdf": str(source_pdf) if source_pdf else "",
+                "extraction_date": extraction_date or "",
+                "validation_status": validation_status,
+                "data_quality_score": data_quality_score,
             })
 
     logger.info("Generated details TSV: %s (%d amendments)",
@@ -650,3 +743,75 @@ def extract_section_context(
             {"letter": let, "text": text.strip()} for let, text in clauses
         ],
     }
+
+
+async def extract_amendments_hybrid(
+    pdf_path: str | Path,
+    config: dict | None = None,
+) -> AmendmentExtractionResult:
+    """Extract amendments using hybrid vision+regex approach.
+    
+    Combines regex-based text extraction with vision LLM analysis
+    for improved accuracy, especially on complex layouts and scanned PDFs.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        config: Configuration for hybrid extraction
+        
+    Returns:
+        AmendmentExtractionResult with extracted amendments
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    
+    logger.info(f"Starting hybrid extraction from {pdf_path}")
+    
+    try:
+        # Import here to avoid circular dependency
+        from .hybrid_extractor import (
+            HybridAmendmentExtractor,
+            HybridExtractionConfig
+        )
+        
+        # Create hybrid extractor with config
+        hybrid_config = HybridExtractionConfig(
+            use_vision=config.get("use_vision", True) if config else True,
+            use_regex=config.get("use_regex", True) if config else True,
+            confidence_threshold=config.get("confidence_threshold", 0.5) if config else 0.5,
+            prefer_vision=config.get("prefer_vision", True) if config else True,
+            require_agreement=config.get("require_agreement", False) if config else False
+        )
+        
+        extractor = HybridAmendmentExtractor(hybrid_config)
+        
+        # Run hybrid extraction
+        hybrid_result = await extractor.extract(pdf_path)
+        
+        # Convert hybrid result to AmendmentExtractionResult format
+        amendments = []
+        errors = []
+        
+        for amendment in hybrid_result.amendments:
+            try:
+                # Convert to ExtractedAmendment format
+                # This is a simplified conversion - in practice would need
+                # to handle different amendment formats
+                amendments.append(amendment)
+            except Exception as e:
+                errors.append(f"Failed to convert amendment: {e}")
+        
+        logger.info(f"Hybrid extraction complete: {len(amendments)} amendments")
+        
+        return AmendmentExtractionResult(
+            pdf_path=pdf_path,
+            amendments=amendments,
+            sections_found=0,  # Would need to extract from hybrid_result
+            errors=errors
+        )
+        
+    except Exception as e:
+        logger.error(f"Hybrid extraction failed: {e}")
+        # Fall back to regex-only extraction
+        logger.info("Falling back to regex-only extraction")
+        return extract_amendments_from_pdf(pdf_path)
