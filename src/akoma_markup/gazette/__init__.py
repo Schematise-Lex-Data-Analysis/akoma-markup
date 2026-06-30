@@ -9,6 +9,17 @@ from .conversion import (
     build_gazette_chain,
     process_gazette_sections,
 )
+from .refine import (
+    group_sections_hierarchically,
+    split_by_token_limit,
+    build_refine_chain,
+    process_refined_chunks,
+    refine_gazette_grouping,
+)
+from .intelligent_refine import (
+    intelligent_group_sections,
+    intelligent_refine_gazette,
+)
 
 __all__ = [
     "extract_sections_with_ai",
@@ -17,4 +28,11 @@ __all__ = [
     "GazetteConverter",
     "build_gazette_chain",
     "process_gazette_sections",
+    "group_sections_hierarchically",
+    "split_by_token_limit",
+    "build_refine_chain",
+    "process_refined_chunks",
+    "refine_gazette_grouping",
+    "intelligent_group_sections",
+    "intelligent_refine_gazette",
 ]

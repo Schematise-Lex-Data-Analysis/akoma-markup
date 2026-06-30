@@ -160,6 +160,67 @@ Running `convert` writes:
 
 `document`, `act_number`, and `replaces` are included only when provided.
 
+## Gazette Processing Commands
+
+The toolkit includes specialized commands for processing Gazette notifications:
+
+### Gazette Extraction & Refinement Workflow
+
+```bash
+# 1. Extract sections from Gazette PDF
+akoma-markup gazette-extract gazette.pdf -o sections.tsv --llm-env .env
+
+# 2. Refine and group sections (intelligent mode)
+akoma-markup gazette-refine sections.tsv -o refined.tsv --intelligent
+
+# 3. Verify and clean refinement output (NEW)
+akoma-markup gazette-refinement-verify refined.tsv -o verified.tsv --llm-env .env
+
+# 4. Convert to Akoma Ntoso markup
+akoma-markup gazette-convert verified.tsv -o markup.txt --llm-env .env
+```
+
+### Gazette Refinement Verification
+
+The `gazette-refinement-verify` command performs LLM-powered verification of Gazette refinement output:
+
+- **Removes unnecessary square brackets** (`[1.]`, `[(3)]`, `[CHAPTER IV]`)
+- **Detects semantic duplicates** with contextual understanding
+- **Normalizes section numbering** and hierarchy
+- **Validates logical grouping** of sections
+- **Preserves important content** like `<<TABLE_REGION:N>>` markers and citations
+
+```bash
+# Basic verification
+akoma-markup gazette-refinement-verify refined.tsv -o verified.tsv --llm-env .env
+
+# Strict verification with large context window
+akoma-markup gazette-refinement-verify input.tsv -o output.tsv \
+  --llm-env .env \
+  --verification-level strict \
+  --context-window 5 \
+  --batch-size 10
+
+# Resume from checkpoint after interruption
+akoma-markup gazette-refinement-verify large.tsv -o verified.tsv --llm-env .env --resume
+
+# Clear existing checkpoint and start fresh
+akoma-markup gazette-refinement-verify input.tsv -o output.tsv \
+  --llm-env .env \
+  --clear-checkpoint \
+  --no-resume
+```
+
+#### Verification Options
+
+- `--verification-level`: `strict`, `moderate` (default), or `light`
+- `--context-window`: Number of surrounding sections for context (default: 3)
+- `--remove-brackets/--no-remove-brackets`: Remove unnecessary brackets (default: true)
+- `--resume/--no-resume`: Resume from checkpoint (default: true)
+- `--batch-size`: Sections to process in parallel (default: 5)
+- `--clear-checkpoint`: Clear existing checkpoint before starting
+- `--verbose`: Enable detailed logging
+
 ## Project layout
 
 ```
@@ -174,6 +235,25 @@ src/akoma_markup/
     tables/
       rescue.py          # table-rescue orchestrator (declared/auto/full)
       render.py          # markdown → bluebell TABLE
+  gazette/               # Gazette notification processing
+    __init__.py
+    ai_extractor.py      # AI-powered section extraction
+    refine.py            # Section grouping refinement
+    intelligent_refine.py # LLM-based intelligent refinement
+    conversion.py        # Gazette-specific conversion
+    converter.py         # Gazette converter interface
+    prompts.py           # Gazette processing prompts
+    verification/        # Gazette refinement verification (NEW)
+      __init__.py
+      engine.py          # LLMVerificationEngine
+      processor.py       # ContentProcessorChain
+      checkpoint.py      # VerificationCheckpointManager
+      chain.py           # Chain builders
+      __main__.py        # CLI command implementation
+  amendment/             # Amendment processing
+    __init__.py
+    extract.py           # Amendment extraction
+    # ... other amendment modules
   util/
     pdf/
       text.py            # pdfplumber text extraction

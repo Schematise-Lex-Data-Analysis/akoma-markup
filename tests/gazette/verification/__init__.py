@@ -1,0 +1,1 @@
+"""Tests for Gazette verification module."""

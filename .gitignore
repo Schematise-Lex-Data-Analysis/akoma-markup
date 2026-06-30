@@ -1,6 +1,9 @@
-.env
+.env-graphdb
 output
 .venv
 __pycache__
 *.egg-info/
 *.pyc
+.env
+.akoma_cache/
+.gitignore
